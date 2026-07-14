@@ -107,6 +107,22 @@ inline T nc_sq_scalar_px_rt(const T *const *rows, unsigned j, unsigned N, unsign
     }
 }
 
+// Runtime-N variant of nc_sq_scalar_px_half (SME does not template on N).
+inline uint16_t nc_sq_scalar_px_half_rt(const uint16_t *const *rows, unsigned j, unsigned N, unsigned W,
+                                        const float *coeffs, float div, float bias, bool saturate)
+{
+    const unsigned S = N / 2;
+    float accum = 0.0f;
+    for (unsigned k = 0; k < N; ++k) {
+        unsigned col = nc_mirror(static_cast<int>(j) + static_cast<int>(k) - static_cast<int>(S), static_cast<int>(W));
+        for (unsigned r = 0; r < N; ++r)
+            accum += coeffs[r * N + k] * nc_half_to_float(rows[r][col]);
+    }
+    float tmp = accum * div + bias;
+    tmp = saturate ? tmp : std::fabs(tmp);
+    return nc_float_to_half(tmp);
+}
+
 // Scalar edge reference for half (binary16) planes: samples widen to float32
 // for the arithmetic and the result narrows back to half, mirroring the C
 // fallback's HalfOp/conv paths.

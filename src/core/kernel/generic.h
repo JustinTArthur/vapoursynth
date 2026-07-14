@@ -427,6 +427,13 @@ DECL(11x11_conv, float, sme)
 DECL(1d_conv_v, byte, sme)
 DECL(1d_conv_v, word, sme)
 DECL(1d_conv_v, float, sme)
+/* half: samples widen to f32 and reuse the ZA32 FMOPA path. */
+DECL(5x5_conv, half, sme)
+DECL(7x7_conv, half, sme)
+DECL(9x9_conv, half, sme)
+DECL(11x11_conv, half, sme)
+DECL(1d_conv_v, half, sme)
+
 #endif /* VS_TARGET_ARM_SME */
 
 #endif /* VS_TARGET_CPU_ARM64 */
