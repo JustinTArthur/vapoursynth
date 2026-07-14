@@ -44,6 +44,13 @@ void vs_lut1_b_b_avx512vbmi(const uint8_t *src, uint8_t *dst, int w, const uint8
 #endif
 #ifdef VS_TARGET_CPU_ARM64
 void vs_lut1_b_b_neon(const uint8_t *src, uint8_t *dst, int w, const uint8_t *lut);
+#ifdef VS_TARGET_ARM_SVE
+/* 16-bit source: the table is 65536 entries, too large to permute, so every other
+   ISA runs this scalar. SVE gathers svcntw() lookups at a time. */
+unsigned vs_sve_vector_length(void);
+void vs_lut1_w_w_sve(const uint16_t *src, uint16_t *dst, int w, const uint16_t *lut);
+void vs_lut1_w_b_sve(const uint16_t *src, uint8_t *dst, int w, const uint8_t *lut);
+#endif
 #endif
 
 namespace {
@@ -55,6 +62,7 @@ typedef struct LutDataExtra {
     bool process[3];
     bool use_vbmi;
     bool use_neon;
+    bool use_sve_gather;
     ~LutDataExtra() { free(lut); };
 } LutDataExtra;
 
@@ -110,6 +118,28 @@ static const VSFrame *VS_CC lutGetframe(int n, int activationReason, void *insta
                         continue; // plane done; skip the scalar fallback
                     }
                 }
+#ifdef VS_TARGET_ARM_SVE
+                if constexpr (std::is_same_v<T, uint16_t> && std::is_same_v<U, uint16_t>) {
+                    if (d->use_sve_gather) {
+                        for (int hl = 0; hl < h; hl++) {
+                            vs_lut1_w_w_sve(srcp, dstp, w, lut);
+                            dstp += dst_stride / sizeof(U);
+                            srcp += src_stride / sizeof(T);
+                        }
+                        continue;
+                    }
+                }
+                if constexpr (std::is_same_v<T, uint16_t> && std::is_same_v<U, uint8_t>) {
+                    if (d->use_sve_gather) {
+                        for (int hl = 0; hl < h; hl++) {
+                            vs_lut1_w_b_sve(srcp, dstp, w, lut);
+                            dstp += dst_stride / sizeof(U);
+                            srcp += src_stride / sizeof(T);
+                        }
+                        continue;
+                    }
+                }
+#endif
 #endif
                 for (int hl = 0; hl < h; hl++) {
                     if constexpr (std::is_same_v<U, uint8_t>) {
@@ -320,12 +350,29 @@ static void VS_CC lutCreate(const VSMap *in, VSMap *out, void *userData, VSCore 
 
         d->use_vbmi = false;
         d->use_neon = false;
+        d->use_sve_gather = false;
 #ifdef VS_TARGET_CPU_X86
         if (getCPUFeatures()->avx512_vbmi && vs_get_cpulevel(core) >= VS_CPU_LEVEL_AVX512)
             d->use_vbmi = true;
 #elif defined(VS_TARGET_CPU_ARM64)
         if (vs_get_cpulevel(core) >= VS_CPU_LEVEL_NEON)
             d->use_neon = true;
+#ifdef VS_TARGET_ARM_SVE
+        // A gather retires svcntw() lookups, so the win scales with vector length,
+        // and it has to beat a scalar path that is already good: for byte output
+        // that path packs 8 lookups into a uint64 and stores once. Measured in the
+        // filter (not a microbenchmark, which flatters the gather by comparing it
+        // against a naive scalar loop):
+        //
+        //   256-bit  word->word +26%, word->byte +14%   (Graviton3)
+        //   128-bit  word->word  -7%, word->byte  -8%   (Graviton4)
+        //
+        // so a gather only pays above 128 bits, for either destination width.
+        if (getCPUFeatures()->sve && vs_get_cpulevel(core) >= VS_CPU_LEVEL_SVE) {
+            if (d->vi->format.bytesPerSample == 2 && vs_sve_vector_length() > 16)
+                d->use_sve_gather = true;
+        }
+#endif
 #endif
 
         if (d->vi->format.bytesPerSample == 1 && bitsout == 8)

@@ -494,7 +494,8 @@ else
         endif
         if arm_have_sve
             arm_vlibs += static_library('vsfilters_sve',
-                files('src/core/kernel/arm/convolution_sve.cpp'),
+                files('src/core/kernel/arm/convolution_sve.cpp',
+                      'src/core/kernel/arm/lut_sve.cpp'),
                 cpp_args: arm_sve_args,
                 gnu_symbol_visibility: 'hidden',
                 include_directories: incdir,
