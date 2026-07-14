@@ -153,6 +153,7 @@ struct GenericDataExtra {
     bool conv_int8;   // all coefficients fit int8 -> byte square conv may take the VNNI path
 
     int cpulevel;
+    int corethreads;  // thread pool size at creation; steers the SME/NEON choice on ARM
 
     void (*func)(const void *, ptrdiff_t, void *, ptrdiff_t, const vs_generic_params *, unsigned, unsigned);
     vs_generic_params params;
@@ -534,6 +535,196 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSSE2(const VSVideoForm
 }
 #endif
 
+#ifdef VS_TARGET_CPU_ARM64
+// Only the convolution family has hand-written ARM kernels; every other op
+// falls through to the (auto-vectorised) C tier.
+template <GenericOperations op>
+static decltype(&vs_generic_3x3_conv_byte_c) genericSelectNEON(const VSVideoFormat *fi, GenericData *d) {
+    if (op != GenericConvolution)
+        return nullptr;
+
+    if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_byte_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_byte_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_byte_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_byte_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_byte_neon;
+        else if (d->convolution_type == ConvolutionHorizontal)
+            return vs_generic_1d_conv_h_byte_neon;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_byte_neon;
+        else if (d->convolution_type == ConvolutionSeparable)
+            return vs_generic_2d_conv_sep_byte_neon;
+    } else if (fi->sampleType == stInteger && fi->bytesPerSample == 2) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_word_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_word_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_word_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_word_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_word_neon;
+        else if (d->convolution_type == ConvolutionHorizontal)
+            return vs_generic_1d_conv_h_word_neon;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_word_neon;
+        else if (d->convolution_type == ConvolutionSeparable)
+            return vs_generic_2d_conv_sep_word_neon;
+    } else if (fi->sampleType == stFloat && fi->bytesPerSample == 4) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_float_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_float_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_float_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_float_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_float_neon;
+        else if (d->convolution_type == ConvolutionHorizontal)
+            return vs_generic_1d_conv_h_float_neon;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_float_neon;
+        else if (d->convolution_type == ConvolutionSeparable)
+            return vs_generic_2d_conv_sep_float_neon;
+    } else if (fi->sampleType == stFloat && fi->bytesPerSample == 2) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_half_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_half_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_half_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_half_neon;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_half_neon;
+        else if (d->convolution_type == ConvolutionHorizontal)
+            return vs_generic_1d_conv_h_half_neon;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_half_neon;
+        else if (d->convolution_type == ConvolutionSeparable)
+            return vs_generic_2d_conv_sep_half_neon;
+    }
+    return nullptr;
+}
+
+#ifdef VS_TARGET_ARM_SVE
+// The SVE kernels run at 32-bit lane density, so they only beat the NEON
+// kernels when vectors are wider than NEON's 128 bits (Graviton4/Neoverse V2
+// runs SVE2 at 128 bits and loses everywhere; Graviton3 at 256 bits wins the
+// shapes below). Within a wide-vector machine the winners measured on
+// Graviton3 are: integer squares (except word 7x7), float squares >= 9x9,
+// byte horizontal/separable, and word 3x3; vertical 1D and the small float
+// kernels stay on NEON.
+template <GenericOperations op>
+static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSVE(const VSVideoFormat *fi, GenericData *d) {
+    if (op != GenericConvolution)
+        return nullptr;
+
+    if (vs_sve_vector_length() <= 16)
+        return nullptr;
+
+    if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_byte_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_byte_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_byte_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_byte_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_byte_sve;
+        else if (d->convolution_type == ConvolutionHorizontal)
+            return vs_generic_1d_conv_h_byte_sve;
+        else if (d->convolution_type == ConvolutionSeparable)
+            return vs_generic_2d_conv_sep_byte_sve;
+    } else if (fi->sampleType == stInteger && fi->bytesPerSample == 2) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_word_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_word_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_word_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_word_sve;
+    } else if (fi->sampleType == stFloat && fi->bytesPerSample == 4) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_float_sve;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_float_sve;
+    }
+    return nullptr;
+}
+#endif // VS_TARGET_ARM_SVE
+
+#ifdef VS_TARGET_ARM_SME
+// SME covers the compute-dense shapes where the outer-product unit pays off:
+// square NxN and vertical 1D. The word 9x9/11x11 kernels accumulate in ZA64
+// and additionally need FEAT_SME_I16I64.
+//
+// The SME unit is shared per core cluster, so with a full thread pool the
+// aggregate throughput of the cheaper integer shapes is better on NEON even
+// though SME wins them decisively single-threaded (measured on M4 Max:
+// 5x5 byte 4.1x single-thread vs 0.63x at 16 threads). Shapes where SME wins
+// even fully contended (byte >= 7x7, float everything, byte vertical) always
+// take SME; the contested ones only on small thread pools.
+template <GenericOperations op>
+static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoFormat *fi, GenericData *d) {
+    if (op != GenericConvolution)
+        return nullptr;
+
+    const CPUFeatures *cpu = getCPUFeatures();
+    const bool few_threads = d->corethreads <= 4;
+
+    if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return few_threads ? vs_generic_5x5_conv_byte_sme : nullptr;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_byte_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_byte_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_byte_sme;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_byte_sme;
+    } else if (fi->sampleType == stInteger && fi->bytesPerSample == 2) {
+        if (!few_threads)
+            return nullptr;
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_word_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_word_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return cpu->sme_i16i64 ? vs_generic_9x9_conv_word_sme : nullptr;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return cpu->sme_i16i64 ? vs_generic_11x11_conv_word_sme : nullptr;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_word_sme;
+    } else if (fi->sampleType == stFloat && fi->bytesPerSample == 4) {
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return vs_generic_5x5_conv_float_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_float_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_float_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+            return vs_generic_11x11_conv_float_sme;
+        else if (d->convolution_type == ConvolutionVertical)
+            return vs_generic_1d_conv_v_float_sme;
+    }
+    return nullptr;
+}
+#endif // VS_TARGET_ARM_SME
+#endif // VS_TARGET_CPU_ARM64
+
 template <GenericOperations op>
 static decltype(&vs_generic_3x3_conv_byte_c) genericSelectC(const VSVideoFormat *fi, GenericData *d) {
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
@@ -863,6 +1054,10 @@ static void VS_CC genericCreate(const VSMap *in, VSMap *out, void *userData, VSC
 
         d->cpulevel = vs_get_cpulevel(core);
 
+        VSCoreInfo ci;
+        vsapi->getCoreInfo(core, &ci);
+        d->corethreads = ci.numThreads;
+
         const VSVideoFormat *fi = &d->vi->format;
         d->func = nullptr;
 #ifdef VS_TARGET_CPU_X86
@@ -873,6 +1068,19 @@ static void VS_CC genericCreate(const VSMap *in, VSMap *out, void *userData, VSC
             d->func = genericSelectAVX2<op>(fi, d.get());
         if (!d->func && d->cpulevel >= VS_CPU_LEVEL_SSE2)
             d->func = genericSelectSSE2<op>(fi, d.get());
+#elif defined(VS_TARGET_CPU_ARM64)
+        const CPUFeatures *cpu = getCPUFeatures();
+        (void)cpu;
+#ifdef VS_TARGET_ARM_SME
+        if (cpu->sme2 && d->cpulevel >= VS_CPU_LEVEL_SME)
+            d->func = genericSelectSME<op>(fi, d.get());
+#endif
+#ifdef VS_TARGET_ARM_SVE
+        if (!d->func && cpu->sve && d->cpulevel >= VS_CPU_LEVEL_SVE)
+            d->func = genericSelectSVE<op>(fi, d.get());
+#endif
+        if (!d->func && d->cpulevel >= VS_CPU_LEVEL_NEON)
+            d->func = genericSelectNEON<op>(fi, d.get());
 #endif
         if (!d->func)
             d->func = genericSelectC<op>(fi, d.get());

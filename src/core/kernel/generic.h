@@ -316,6 +316,105 @@ DECL(11x11_conv, byte, avx512vnni)
 
 #endif /* VS_TARGET_CPU_X86 */
 
+#ifdef VS_TARGET_CPU_ARM64
+/* NEON baseline kernels: the whole convolution family (square 3x3..11x11,
+   1D horizontal/vertical, separable) for byte/word/float/half. Integer paths
+   are bit-exact with the C reference; float/half use FMA. */
+DECL_3x3(conv, byte, neon)
+DECL_3x3(conv, word, neon)
+DECL_3x3(conv, float, neon)
+DECL_3x3(conv, half, neon)
+
+DECL(5x5_conv, byte, neon)
+DECL(7x7_conv, byte, neon)
+DECL(9x9_conv, byte, neon)
+DECL(11x11_conv, byte, neon)
+DECL(5x5_conv, word, neon)
+DECL(7x7_conv, word, neon)
+DECL(9x9_conv, word, neon)
+DECL(11x11_conv, word, neon)
+DECL(5x5_conv, float, neon)
+DECL(7x7_conv, float, neon)
+DECL(9x9_conv, float, neon)
+DECL(11x11_conv, float, neon)
+DECL(5x5_conv, half, neon)
+DECL(7x7_conv, half, neon)
+DECL(9x9_conv, half, neon)
+DECL(11x11_conv, half, neon)
+
+DECL(1d_conv_h, byte, neon)
+DECL(1d_conv_h, word, neon)
+DECL(1d_conv_h, float, neon)
+DECL(1d_conv_h, half, neon)
+
+DECL(1d_conv_v, byte, neon)
+DECL(1d_conv_v, word, neon)
+DECL(1d_conv_v, float, neon)
+DECL(1d_conv_v, half, neon)
+
+DECL(2d_conv_sep, byte, neon)
+DECL(2d_conv_sep, word, neon)
+DECL(2d_conv_sep, float, neon)
+DECL(2d_conv_sep, half, neon)
+
+#ifdef VS_TARGET_ARM_SVE
+/* Non-streaming SVE (VLA) kernels; never built or dispatched on Apple silicon. */
+unsigned vs_sve_vector_length(void);
+
+DECL_3x3(conv, byte, sve)
+DECL_3x3(conv, word, sve)
+DECL_3x3(conv, float, sve)
+
+DECL(5x5_conv, byte, sve)
+DECL(7x7_conv, byte, sve)
+DECL(9x9_conv, byte, sve)
+DECL(11x11_conv, byte, sve)
+DECL(5x5_conv, word, sve)
+DECL(7x7_conv, word, sve)
+DECL(9x9_conv, word, sve)
+DECL(11x11_conv, word, sve)
+DECL(5x5_conv, float, sve)
+DECL(7x7_conv, float, sve)
+DECL(9x9_conv, float, sve)
+DECL(11x11_conv, float, sve)
+
+DECL(1d_conv_h, byte, sve)
+DECL(1d_conv_h, word, sve)
+DECL(1d_conv_h, float, sve)
+
+DECL(1d_conv_v, byte, sve)
+DECL(1d_conv_v, word, sve)
+DECL(1d_conv_v, float, sve)
+
+DECL(2d_conv_sep, byte, sve)
+DECL(2d_conv_sep, word, sve)
+DECL(2d_conv_sep, float, sve)
+#endif /* VS_TARGET_ARM_SVE */
+
+#ifdef VS_TARGET_ARM_SME
+/* SME2 streaming-mode kernels (square NxN outer products and vertical 1D);
+   byte/word via 2-way int16 SMOPA into ZA32 (word 9x9/11x11 via 4-way int16
+   SMOPA into ZA64, needs FEAT_SME_I16I64), float via FMOPA. */
+DECL(5x5_conv, byte, sme)
+DECL(7x7_conv, byte, sme)
+DECL(9x9_conv, byte, sme)
+DECL(11x11_conv, byte, sme)
+DECL(5x5_conv, word, sme)
+DECL(7x7_conv, word, sme)
+DECL(9x9_conv, word, sme)
+DECL(11x11_conv, word, sme)
+DECL(5x5_conv, float, sme)
+DECL(7x7_conv, float, sme)
+DECL(9x9_conv, float, sme)
+DECL(11x11_conv, float, sme)
+
+DECL(1d_conv_v, byte, sme)
+DECL(1d_conv_v, word, sme)
+DECL(1d_conv_v, float, sme)
+#endif /* VS_TARGET_ARM_SME */
+
+#endif /* VS_TARGET_CPU_ARM64 */
+
 #undef DECL_3x3
 #undef DECL
 

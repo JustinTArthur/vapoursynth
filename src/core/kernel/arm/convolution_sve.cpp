@@ -1,0 +1,495 @@
+/*
+* Copyright (c) 2012-2026 Fredrik Mellbin
+*
+* This file is part of VapourSynth.
+*
+* VapourSynth is free software; you can redistribute it and/or
+* modify it under the terms of the GNU Lesser General Public
+* License as published by the Free Software Foundation; either
+* version 2.1 of the License, or (at your option) any later version.
+*
+* VapourSynth is distributed in the hope that it will be useful,
+* but WITHOUT ANY WARRANTY; without even the implied warranty of
+* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+* Lesser General Public License for more details.
+*
+* You should have received a copy of the GNU Lesser General Public
+* License along with VapourSynth; if not, write to the Free Software
+* Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+*/
+
+/*
+* Non-streaming SVE (VLA) convolution kernels: square NxN (3x3..11x11),
+* 1D horizontal/vertical and separable, for byte/word/float. Never built on
+* Apple platforms (no non-streaming SVE there) and requires only base SVE
+* (Graviton3 / Neoverse V1 upward; SVE2 not assumed).
+*
+* Everything runs at int32/float32 lane density with predicated loads and
+* stores, so there is no scalar interior tail; only the mirror/replicate edge
+* columns use the scalar reference paths.
+*
+* Integer math: pixels widen to 32-bit lanes on load. byte accumulates
+* unbiased (worst case 121 * 1023 * 255 fits int32). word subtracts 32768 on
+* load; the biased worst case fits int32 through 7x7 and 1D (25 taps), and
+* the coefficient*bias sum is added back exactly, so results are bit-exact
+* with the C reference. word 9x9/11x11 sums each row in int32 and spills to
+* int64 lanes (unpklo/unpkhi), matching the int64 C reference bit-exactly.
+* float uses fused MLA (not bit-exact with C, as on the other SIMD tiers).
+*/
+
+#include <arm_sve.h>
+#include <cstdint>
+#include <vector>
+#include "../generic.h"
+#include "conv_scalar.h"
+
+namespace {
+
+enum class SvType { Byte, Word, Float };
+
+template <SvType TY>
+struct sv_traits;
+template <> struct sv_traits<SvType::Byte>  { typedef uint8_t T; typedef int32_t Acc; typedef int16_t Weight; };
+template <> struct sv_traits<SvType::Word>  { typedef uint16_t T; typedef int32_t Acc; typedef int16_t Weight; };
+template <> struct sv_traits<SvType::Float> { typedef float T; typedef float Acc; typedef float Weight; };
+
+template <SvType TY>
+inline const typename sv_traits<TY>::Weight *sv_coeffs(const vs_generic_params &p)
+{
+    if constexpr (TY == SvType::Float)
+        return p.matrixf;
+    else
+        return p.matrix;
+}
+
+// Pixel load widened to 32-bit lanes; word pixels come back biased by -32768.
+template <SvType TY>
+inline svint32_t sv_load_px(svbool_t pg, const typename sv_traits<TY>::T *p)
+{
+    if constexpr (TY == SvType::Byte)
+        return svreinterpret_s32_u32(svld1ub_u32(pg, p));
+    else
+        return svsub_n_s32_x(pg, svreinterpret_s32_u32(svld1uh_u32(pg, p)), 32768);
+}
+
+// scale/bias/saturate + round + clamp + narrowing store of one int32 vector.
+template <SvType TY>
+inline void sv_store_int(typename sv_traits<TY>::T *dst, svbool_t pg, svint32_t acc, int32_t wb,
+                         float div, float bias, uint32_t satmask, int32_t maxclamp)
+{
+    svbool_t pt = svptrue_b32();
+    acc = svsub_n_s32_x(pt, acc, wb);
+    svfloat32_t f = svcvt_f32_s32_x(pt, acc);
+    f = svmad_n_f32_x(pt, f, svdup_f32(div), bias);
+    f = svreinterpret_f32_u32(svand_n_u32_x(pt, svreinterpret_u32_f32(f), satmask));
+    f = svrintn_f32_x(pt, f);
+    svint32_t r = svcvt_s32_f32_x(pt, f);
+    r = svmax_n_s32_x(pt, r, 0);
+    r = svmin_n_s32_x(pt, r, maxclamp);
+    if constexpr (TY == SvType::Byte)
+        svst1b_s32(pg, reinterpret_cast<int8_t *>(dst), r);
+    else
+        svst1h_s32(pg, reinterpret_cast<int16_t *>(dst), r);
+}
+
+inline void sv_store_float(float *dst, svbool_t pg, svfloat32_t acc, float div, float bias, uint32_t satmask)
+{
+    svbool_t pt = svptrue_b32();
+    svfloat32_t f = svmad_n_f32_x(pt, acc, svdup_f32(div), bias);
+    f = svreinterpret_f32_u32(svand_n_u32_x(pt, svreinterpret_u32_f32(f), satmask));
+    svst1_f32(pg, dst, f);
+}
+
+// Store one int64-accumulated half (svcntd pixels) of a word vector strip.
+// int64 -> float32 lands in the even float lane of each doubleword; the f32
+// pipeline runs on all lanes (odd lanes garbage) and st1h writes the low 16
+// bits of each doubleword.
+inline void sv_store_word_i64_half(uint16_t *dst, unsigned valid, svint64_t acc, int64_t wb,
+                                   float div, float bias, uint32_t satmask, int32_t maxclamp)
+{
+    if (!valid)
+        return;
+    svbool_t pt32 = svptrue_b32();
+    svbool_t pt64 = svptrue_b64();
+    svbool_t pgd = svwhilelt_b64_u32(0, valid);
+    acc = svsub_n_s64_x(pt64, acc, wb);
+    svfloat32_t f = svcvt_f32_s64_x(pt64, acc);
+    f = svmad_n_f32_x(pt32, f, svdup_f32(div), bias);
+    f = svreinterpret_f32_u32(svand_n_u32_x(pt32, svreinterpret_u32_f32(f), satmask));
+    f = svrintn_f32_x(pt32, f);
+    svint32_t r = svcvt_s32_f32_x(pt32, f);
+    r = svmax_n_s32_x(pt32, r, 0);
+    r = svmin_n_s32_x(pt32, r, maxclamp);
+    svst1h_s64(pgd, reinterpret_cast<int16_t *>(dst), svreinterpret_s64_s32(r));
+}
+
+template <SvType TY>
+inline int32_t sv_word_bias_sum(const typename sv_traits<TY>::Weight *coeffs, unsigned n)
+{
+    if constexpr (TY == SvType::Word) {
+        int32_t wb = 0;
+        for (unsigned i = 0; i < n; ++i)
+            wb += -32768 * static_cast<int32_t>(coeffs[i]);
+        return wb;
+    } else {
+        (void)coeffs; (void)n;
+        return 0;
+    }
+}
+
+// ---- square NxN ---------------------------------------------------------------
+
+template <SvType TY>
+typename sv_traits<TY>::T sv_sq_edge_px(const typename sv_traits<TY>::T *const *rows, unsigned j, unsigned N, unsigned W,
+                                        const vs_generic_params &p)
+{
+    if constexpr (TY == SvType::Byte) {
+        return nc_sq_scalar_px_rt<uint8_t, int32_t, int16_t>(rows, j, N, W, p.matrix, p.div, p.bias, p.saturate, p.maxval);
+    } else if constexpr (TY == SvType::Word) {
+        if (N > 5)
+            return nc_sq_scalar_px_rt<uint16_t, int64_t, int16_t>(rows, j, N, W, p.matrix, p.div, p.bias, p.saturate, p.maxval);
+        else
+            return nc_sq_scalar_px_rt<uint16_t, int32_t, int16_t>(rows, j, N, W, p.matrix, p.div, p.bias, p.saturate, p.maxval);
+    } else {
+        return nc_sq_scalar_px_rt<float, float, float>(rows, j, N, W, p.matrixf, p.div, p.bias, p.saturate, p.maxval);
+    }
+}
+
+template <SvType TY>
+void sv_sq_plane(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
+                 const vs_generic_params &p, unsigned W, unsigned H, unsigned N)
+{
+    typedef typename sv_traits<TY>::T T;
+    const auto *m = sv_coeffs<TY>(p);
+    const unsigned S = N / 2;
+    const uint32_t satmask = p.saturate ? 0xFFFFFFFFu : 0x7FFFFFFFu;
+    const unsigned cw = static_cast<unsigned>(svcntw());
+    const bool word64 = TY == SvType::Word && N > 7;
+    const unsigned Wend = W > S ? W - S : 0;
+
+    int32_t wb32 = sv_word_bias_sum<TY>(m, N * N);
+    int64_t wb64 = 0;
+    if (word64)
+        for (unsigned i = 0; i < N * N; ++i) wb64 += -32768 * static_cast<int64_t>(m[i]);
+
+    std::vector<const uint8_t *> rows_all(H + 2 * S);
+    for (unsigned t = 0; t < H + 2 * S; ++t)
+        rows_all[t] = static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(nc_mirror(static_cast<int>(t) - static_cast<int>(S), static_cast<int>(H))) * ss;
+
+    for (unsigned i = 0; i < H; ++i) {
+        const T *const *rows = reinterpret_cast<const T *const *>(rows_all.data() + i);
+        T *d = reinterpret_cast<T *>(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(i) * ds);
+
+        for (unsigned j = S; j < Wend; j += cw) {
+            unsigned valid = std::min(cw, Wend - j);
+            svbool_t pg = svwhilelt_b32_u32(0, valid);
+            if constexpr (TY == SvType::Float) {
+                svfloat32_t acc = svdup_f32(0.0f);
+                for (unsigned r = 0; r < N; ++r) {
+                    const float *row = rows[r] + (j - S);
+                    for (unsigned k = 0; k < N; ++k)
+                        acc = svmla_n_f32_x(svptrue_b32(), acc, svld1_f32(pg, row + k), m[r * N + k]);
+                }
+                sv_store_float(d + j, pg, acc, p.div, p.bias, satmask);
+            } else if (word64) {
+                svint64_t alo = svdup_s64(0), ahi = svdup_s64(0);
+                for (unsigned r = 0; r < N; ++r) {
+                    const T *row = rows[r] + (j - S);
+                    svint32_t rs = svdup_s32(0);
+                    for (unsigned k = 0; k < N; ++k)
+                        rs = svmla_n_s32_x(svptrue_b32(), rs, sv_load_px<TY>(pg, row + k), m[r * N + k]);
+                    alo = svadd_s64_x(svptrue_b64(), alo, svunpklo_s64(rs));
+                    ahi = svadd_s64_x(svptrue_b64(), ahi, svunpkhi_s64(rs));
+                }
+                unsigned cd = static_cast<unsigned>(svcntd());
+                uint16_t *dw = reinterpret_cast<uint16_t *>(d) + j;
+                sv_store_word_i64_half(dw, std::min(valid, cd), alo, wb64, p.div, p.bias, satmask, p.maxval);
+                sv_store_word_i64_half(dw + cd, valid > cd ? valid - cd : 0, ahi, wb64, p.div, p.bias, satmask, p.maxval);
+            } else {
+                svint32_t acc = svdup_s32(0);
+                for (unsigned r = 0; r < N; ++r) {
+                    const T *row = rows[r] + (j - S);
+                    for (unsigned k = 0; k < N; ++k)
+                        acc = svmla_n_s32_x(svptrue_b32(), acc, sv_load_px<TY>(pg, row + k), m[r * N + k]);
+                }
+                sv_store_int<TY>(d + j, pg, acc, wb32, p.div, p.bias, satmask, p.maxval);
+            }
+        }
+
+        // Mirror edge columns via the scalar reference.
+        const unsigned edge = std::min(W, S);
+        for (unsigned j = 0; j < edge; ++j)
+            d[j] = sv_sq_edge_px<TY>(rows, j, N, W, p);
+        for (unsigned j = std::max(S, W > edge ? W - edge : 0); j < W; ++j)
+            d[j] = sv_sq_edge_px<TY>(rows, j, N, W, p);
+    }
+}
+
+// ---- 1D -----------------------------------------------------------------------
+
+// Scalar mirror-edge pixel replicating conv_scanline_h verbatim.
+template <SvType TY>
+typename sv_traits<TY>::T sv_h_edge_px(const typename sv_traits<TY>::T *srcp, unsigned j, unsigned width,
+                                       const vs_generic_params &p)
+{
+    typedef typename sv_traits<TY>::Acc Acc;
+    const auto *coeffs = sv_coeffs<TY>(p);
+    unsigned fwidth = p.matrixsize;
+    unsigned support = fwidth / 2;
+    unsigned dist_from_right = width - 1 - j;
+
+    Acc accum = 0;
+    for (unsigned k = 0; k < support; ++k) {
+        unsigned idx = j < support - k ? std::min(support - k - j - 1, width - 1) : j - support + k;
+        accum += coeffs[k] * static_cast<Acc>(srcp[idx]);
+    }
+    for (unsigned k = support; k < fwidth; ++k) {
+        unsigned idx = dist_from_right < k - support ? width - std::min(k - support - dist_from_right, width) : j - support + k;
+        accum += coeffs[k] * static_cast<Acc>(srcp[idx]);
+    }
+    float tmp = static_cast<float>(accum) * p.div + p.bias;
+    tmp = p.saturate ? tmp : std::fabs(tmp);
+    if constexpr (TY == SvType::Float) {
+        return tmp;
+    } else {
+        float c = std::min(std::max(tmp, 0.0f), static_cast<float>(sizeof(typename sv_traits<TY>::T) == 1 ? 255 : 65535));
+        long v = std::lrint(c);
+        return static_cast<typename sv_traits<TY>::T>(std::min<long>(v, p.maxval));
+    }
+}
+
+template <SvType TY>
+void sv_h_scanline(const typename sv_traits<TY>::T *srcp, typename sv_traits<TY>::T *dstp, unsigned width,
+                   const vs_generic_params &p, uint32_t satmask, int32_t wb)
+{
+    const auto *coeffs = sv_coeffs<TY>(p);
+    unsigned fwidth = p.matrixsize;
+    unsigned support = fwidth / 2;
+    const unsigned cw = static_cast<unsigned>(svcntw());
+
+    for (unsigned j = 0; j < std::min(width, support); ++j)
+        dstp[j] = sv_h_edge_px<TY>(srcp, j, width, p);
+
+    unsigned end = width - std::min(width, support);
+    for (unsigned j = support; j < end; j += cw) {
+        unsigned valid = std::min(cw, end - j);
+        svbool_t pg = svwhilelt_b32_u32(0, valid);
+        if constexpr (TY == SvType::Float) {
+            svfloat32_t acc = svdup_f32(0.0f);
+            for (unsigned k = 0; k < fwidth; ++k)
+                acc = svmla_n_f32_x(svptrue_b32(), acc, svld1_f32(pg, srcp + j - support + k), coeffs[k]);
+            sv_store_float(dstp + j, pg, acc, p.div, p.bias, satmask);
+        } else {
+            svint32_t acc = svdup_s32(0);
+            for (unsigned k = 0; k < fwidth; ++k)
+                acc = svmla_n_s32_x(svptrue_b32(), acc, sv_load_px<TY>(pg, srcp + j - support + k), coeffs[k]);
+            sv_store_int<TY>(dstp + j, pg, acc, wb, p.div, p.bias, satmask, p.maxval);
+        }
+    }
+
+    for (unsigned j = std::max(support, end); j < width; ++j)
+        dstp[j] = sv_h_edge_px<TY>(srcp, j, width, p);
+}
+
+template <SvType TY>
+void sv_v_scanline(const void *const *srcs, typename sv_traits<TY>::T *dstp, unsigned width,
+                   const vs_generic_params &p, uint32_t satmask, int32_t wb)
+{
+    typedef typename sv_traits<TY>::T T;
+    const auto *coeffs = sv_coeffs<TY>(p);
+    unsigned fwidth = p.matrixsize;
+    const unsigned cw = static_cast<unsigned>(svcntw());
+
+    for (unsigned j = 0; j < width; j += cw) {
+        unsigned valid = std::min(cw, width - j);
+        svbool_t pg = svwhilelt_b32_u32(0, valid);
+        if constexpr (TY == SvType::Float) {
+            svfloat32_t acc = svdup_f32(0.0f);
+            for (unsigned k = 0; k < fwidth; ++k)
+                acc = svmla_n_f32_x(svptrue_b32(), acc, svld1_f32(pg, static_cast<const float *>(srcs[k]) + j), coeffs[k]);
+            sv_store_float(dstp + j, pg, acc, p.div, p.bias, satmask);
+        } else {
+            svint32_t acc = svdup_s32(0);
+            for (unsigned k = 0; k < fwidth; ++k)
+                acc = svmla_n_s32_x(svptrue_b32(), acc, sv_load_px<TY>(pg, static_cast<const T *>(srcs[k]) + j), coeffs[k]);
+            sv_store_int<TY>(dstp + j, pg, acc, wb, p.div, p.bias, satmask, p.maxval);
+        }
+    }
+}
+
+// Row-pointer selection replicating conv_plane_v / conv_plane_x verbatim.
+inline void sv_select_rows(const void *src, ptrdiff_t src_stride, const void *srcp[25],
+                           unsigned i, unsigned height, unsigned fwidth)
+{
+    unsigned support = fwidth / 2;
+    unsigned dist_from_bottom = height - 1 - i;
+
+    for (unsigned k = 0; k < support; ++k) {
+        unsigned row = i < support - k ? std::min(support - k - i - 1, height - 1) : i - support + k;
+        srcp[k] = static_cast<const unsigned char *>(src) + static_cast<ptrdiff_t>(row) * src_stride;
+    }
+    for (unsigned k = support; k < fwidth; ++k) {
+        unsigned row = dist_from_bottom < k - support ? height - std::min(k - support - dist_from_bottom, i) : i - support + k;
+        srcp[k] = static_cast<const unsigned char *>(src) + static_cast<ptrdiff_t>(row) * src_stride;
+    }
+}
+
+template <SvType TY>
+void sv_plane_h(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
+                const vs_generic_params &p, unsigned width, unsigned height)
+{
+    typedef typename sv_traits<TY>::T T;
+    const uint32_t satmask = p.saturate ? 0xFFFFFFFFu : 0x7FFFFFFFu;
+    int32_t wb = sv_word_bias_sum<TY>(sv_coeffs<TY>(p), p.matrixsize);
+    for (unsigned i = 0; i < height; ++i) {
+        const T *srcp = reinterpret_cast<const T *>(static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(i) * ss);
+        T *dstp = reinterpret_cast<T *>(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(i) * ds);
+        sv_h_scanline<TY>(srcp, dstp, width, p, satmask, wb);
+    }
+}
+
+template <SvType TY>
+void sv_plane_v(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
+                const vs_generic_params &p, unsigned width, unsigned height)
+{
+    typedef typename sv_traits<TY>::T T;
+    const uint32_t satmask = p.saturate ? 0xFFFFFFFFu : 0x7FFFFFFFu;
+    int32_t wb = sv_word_bias_sum<TY>(sv_coeffs<TY>(p), p.matrixsize);
+    for (unsigned i = 0; i < height; ++i) {
+        const void *srcp[25];
+        sv_select_rows(src, ss, srcp, i, height, p.matrixsize);
+        T *dstp = reinterpret_cast<T *>(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(i) * ds);
+        sv_v_scanline<TY>(srcp, dstp, width, p, satmask, wb);
+    }
+}
+
+template <SvType TY>
+void sv_plane_x(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
+                const vs_generic_params &p, unsigned width, unsigned height)
+{
+    typedef typename sv_traits<TY>::T T;
+    const uint32_t satmask = p.saturate ? 0xFFFFFFFFu : 0x7FFFFFFFu;
+    int32_t wb = sv_word_bias_sum<TY>(sv_coeffs<TY>(p), p.matrixsize);
+    std::vector<T> tmp(width);
+    for (unsigned i = 0; i < height; ++i) {
+        const void *srcp[25];
+        sv_select_rows(src, ss, srcp, i, height, p.matrixsize);
+        T *dstp = reinterpret_cast<T *>(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(i) * ds);
+        sv_v_scanline<TY>(srcp, tmp.data(), width, p, satmask, wb);
+        sv_h_scanline<TY>(tmp.data(), dstp, width, p, satmask, wb);
+    }
+}
+
+// ---- 3x3 (replicate edges, filter_plane_3x3 semantics) -------------------------
+
+template <SvType TY>
+void sv_plane_3x3(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
+                  const vs_generic_params &p, unsigned width, unsigned height)
+{
+    typedef typename sv_traits<TY>::T T;
+    typedef typename sv_traits<TY>::Acc Acc;
+    const auto *coeffs = sv_coeffs<TY>(p);
+    const uint32_t satmask = p.saturate ? 0xFFFFFFFFu : 0x7FFFFFFFu;
+    int32_t wb = sv_word_bias_sum<TY>(coeffs, 9);
+    const unsigned cw = static_cast<unsigned>(svcntw());
+
+    for (unsigned i = 0; i < height; ++i) {
+        unsigned above_idx = i == 0 ? 0 : i - 1;
+        unsigned below_idx = i == height - 1 ? height - 1 : i + 1;
+        const T *rows[3] = {
+            reinterpret_cast<const T *>(static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(above_idx) * ss),
+            reinterpret_cast<const T *>(static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(i) * ss),
+            reinterpret_cast<const T *>(static_cast<const uint8_t *>(src) + static_cast<ptrdiff_t>(below_idx) * ss),
+        };
+        T *dstp = reinterpret_cast<T *>(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(i) * ds);
+
+        auto scalar_px = [&](unsigned a, unsigned b, unsigned c) -> T {
+            Acc accum = 0;
+            for (unsigned r = 0; r < 3; ++r) {
+                accum += coeffs[r * 3 + 0] * static_cast<Acc>(rows[r][a]);
+                accum += coeffs[r * 3 + 1] * static_cast<Acc>(rows[r][b]);
+                accum += coeffs[r * 3 + 2] * static_cast<Acc>(rows[r][c]);
+            }
+            float tmp = static_cast<float>(accum) * p.div + p.bias;
+            tmp = p.saturate ? tmp : std::fabs(tmp);
+            if constexpr (TY == SvType::Float) {
+                return tmp;
+            } else {
+                float cl = std::min(std::max(tmp, 0.0f), static_cast<float>(sizeof(T) == 1 ? 255 : 65535));
+                long v = std::lrint(cl);
+                return static_cast<T>(std::min<long>(v, p.maxval));
+            }
+        };
+
+        dstp[0] = scalar_px(0, 0, width > 1 ? 1 : 0);
+
+        unsigned end = width > 1 ? width - 1 : 0;
+        for (unsigned j = 1; j < end; j += cw) {
+            unsigned valid = std::min(cw, end - j);
+            svbool_t pg = svwhilelt_b32_u32(0, valid);
+            if constexpr (TY == SvType::Float) {
+                svfloat32_t acc = svdup_f32(0.0f);
+                for (unsigned r = 0; r < 3; ++r)
+                    for (unsigned k = 0; k < 3; ++k)
+                        acc = svmla_n_f32_x(svptrue_b32(), acc, svld1_f32(pg, rows[r] + j - 1 + k), coeffs[r * 3 + k]);
+                sv_store_float(dstp + j, pg, acc, p.div, p.bias, satmask);
+            } else {
+                svint32_t acc = svdup_s32(0);
+                for (unsigned r = 0; r < 3; ++r)
+                    for (unsigned k = 0; k < 3; ++k)
+                        acc = svmla_n_s32_x(svptrue_b32(), acc, sv_load_px<TY>(pg, rows[r] + j - 1 + k), coeffs[r * 3 + k]);
+                sv_store_int<TY>(dstp + j, pg, acc, wb, p.div, p.bias, satmask, p.maxval);
+            }
+        }
+
+        if (width > 1)
+            dstp[width - 1] = scalar_px(width - 2, width - 1, width - 1);
+    }
+}
+
+} // namespace
+
+// Runtime SVE vector length in bytes, for the dispatcher (which is not
+// compiled with +sve and so cannot use svcntb itself). Only called after the
+// CPU is known to report SVE.
+unsigned vs_sve_vector_length(void)
+{
+    return static_cast<unsigned>(svcntb());
+}
+
+#define VS_SVE_SQUARE_ENTRY(SZ, N, TY, TN) \
+    void vs_generic_##SZ##_conv_##TN##_sve(const void *src, ptrdiff_t src_stride, void *dst, ptrdiff_t dst_stride, const struct vs_generic_params *params, unsigned width, unsigned height) \
+    { sv_sq_plane<SvType::TY>(src, src_stride, dst, dst_stride, *params, width, height, N); }
+
+VS_SVE_SQUARE_ENTRY(5x5,   5,  Byte,  byte)
+VS_SVE_SQUARE_ENTRY(7x7,   7,  Byte,  byte)
+VS_SVE_SQUARE_ENTRY(9x9,   9,  Byte,  byte)
+VS_SVE_SQUARE_ENTRY(11x11, 11, Byte,  byte)
+VS_SVE_SQUARE_ENTRY(5x5,   5,  Word,  word)
+VS_SVE_SQUARE_ENTRY(7x7,   7,  Word,  word)
+VS_SVE_SQUARE_ENTRY(9x9,   9,  Word,  word)
+VS_SVE_SQUARE_ENTRY(11x11, 11, Word,  word)
+VS_SVE_SQUARE_ENTRY(5x5,   5,  Float, float)
+VS_SVE_SQUARE_ENTRY(7x7,   7,  Float, float)
+VS_SVE_SQUARE_ENTRY(9x9,   9,  Float, float)
+VS_SVE_SQUARE_ENTRY(11x11, 11, Float, float)
+
+#define VS_SVE_ENTRY(KERNEL, FN, TY, TN) \
+    void vs_generic_##KERNEL##_##TN##_sve(const void *src, ptrdiff_t src_stride, void *dst, ptrdiff_t dst_stride, const struct vs_generic_params *params, unsigned width, unsigned height) \
+    { FN<SvType::TY>(src, src_stride, dst, dst_stride, *params, width, height); }
+
+VS_SVE_ENTRY(3x3_conv, sv_plane_3x3, Byte, byte)
+VS_SVE_ENTRY(3x3_conv, sv_plane_3x3, Word, word)
+VS_SVE_ENTRY(3x3_conv, sv_plane_3x3, Float, float)
+
+VS_SVE_ENTRY(1d_conv_h, sv_plane_h, Byte, byte)
+VS_SVE_ENTRY(1d_conv_h, sv_plane_h, Word, word)
+VS_SVE_ENTRY(1d_conv_h, sv_plane_h, Float, float)
+
+VS_SVE_ENTRY(1d_conv_v, sv_plane_v, Byte, byte)
+VS_SVE_ENTRY(1d_conv_v, sv_plane_v, Word, word)
+VS_SVE_ENTRY(1d_conv_v, sv_plane_v, Float, float)
+
+VS_SVE_ENTRY(2d_conv_sep, sv_plane_x, Byte, byte)
+VS_SVE_ENTRY(2d_conv_sep, sv_plane_x, Word, word)
+VS_SVE_ENTRY(2d_conv_sep, sv_plane_x, Float, float)

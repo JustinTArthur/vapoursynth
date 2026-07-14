@@ -8,6 +8,7 @@ project('VapourSynth', 'c', 'cpp', 'cython',
 
 enable_guard_pattern = get_option('enable_guard_pattern')
 enable_x86_asm = get_option('enable_x86_asm')
+enable_arm_asm = get_option('enable_arm_asm')
 
 cxx = meson.get_compiler('cpp')
 
@@ -62,6 +63,10 @@ endif
 
 if not host_cpu_family.startswith('x86')
     enable_x86_asm = false
+endif
+
+if host_cpu_family != 'aarch64'
+    enable_arm_asm = false
 endif
 
 incdir = include_directories('include')
@@ -161,6 +166,55 @@ soversion = is_win ? '' : run_command(
 
 if enable_x86_asm
     add_project_arguments('-DVS_TARGET_CPU_X86', language: ['c', 'cpp'])
+endif
+
+# --- AArch64 SIMD tiers ------------------------------------------------------
+# NEON is the AArch64 baseline and its kernels ride along with the plain filter
+# sources. fp16/dotprod kernels get their own TUs with a raised -march; they are
+# runtime-dispatched. Non-streaming SVE exists only off Apple platforms. SME
+# kernels are compiled in a dedicated TU where every function is
+# __arm_locally_streaming: with +sme enabled the auto-vectoriser may otherwise
+# emit streaming-only SVE in regular functions, which faults outside streaming
+# mode -- keeping the whole TU streaming sidesteps that entirely.
+arm_have_sve = false
+arm_have_sme = false
+if enable_arm_asm
+    add_project_arguments('-DVS_TARGET_CPU_ARM64', language: ['c', 'cpp'])
+
+    arm_fp16_args = ['-march=armv8.2-a+fp16']
+    arm_dotprod_args = ['-march=armv8.2-a+dotprod']
+    arm_sve_args = ['-march=armv8.2-a+sve']
+    arm_sme_args = ['-march=armv8.6-a+sme2+sme-i16i64']
+
+    if host_system != 'darwin'
+        arm_have_sve = cxx.compiles('''
+#include <arm_sve.h>
+svfloat32_t f(svfloat32_t a, svfloat32_t b) { return svmla_f32_x(svptrue_b32(), a, a, b); }
+''',
+            args: arm_sve_args,
+            name: 'AArch64 non-streaming SVE intrinsics',
+        )
+    endif
+
+    arm_have_sme = cxx.compiles('''
+#include <arm_sme.h>
+__arm_locally_streaming __arm_new("za") void f(const int16_t *p) {
+    svbool_t pg = svptrue_b16();
+    svint16_t v = svld1_s16(pg, p);
+    svmopa_za32_s16_m(0, pg, pg, v, v);
+    svmopa_za64_s16_m(0, pg, pg, v, v);
+}
+''',
+        args: arm_sme_args,
+        name: 'AArch64 SME2 streaming intrinsics',
+    )
+
+    if arm_have_sve
+        add_project_arguments('-DVS_TARGET_ARM_SVE', language: ['c', 'cpp'])
+    endif
+    if arm_have_sme
+        add_project_arguments('-DVS_TARGET_ARM_SME', language: ['c', 'cpp'])
+    endif
 endif
 
 libvapoursynth = library('libvapoursynth',
@@ -392,10 +446,40 @@ if enable_x86_asm
         )
     endforeach
 else
+    arm_filter_sources = []
+    arm_vlibs = []
+    if enable_arm_asm
+        # NEON is the AArch64 baseline; its kernels ride with the plugin proper.
+        arm_filter_sources += files(
+            'src/core/kernel/arm/convolution_neon.cpp',
+            'src/core/kernel/arm/lut_neon.cpp',
+            'src/core/kernel/arm/square_neon.cpp',
+        )
+        if arm_have_sve
+            arm_vlibs += static_library('vsfilters_sve',
+                files('src/core/kernel/arm/convolution_sve.cpp'),
+                cpp_args: arm_sve_args,
+                gnu_symbol_visibility: 'hidden',
+                include_directories: incdir,
+            )
+        endif
+        if arm_have_sme
+            # Every function in this TU is __arm_locally_streaming; nothing
+            # else may be compiled with +sme (see the SME notes above).
+            arm_vlibs += static_library('vsfilters_sme',
+                files('src/core/kernel/arm/convolution_sme.cpp'),
+                cpp_args: arm_sme_args,
+                gnu_symbol_visibility: 'hidden',
+                include_directories: incdir,
+            )
+        endif
+    endif
+
     shared_module('libvapoursynthfilters',
-        filters_sources,
+        filters_sources + arm_filter_sources,
         gnu_symbol_visibility: 'hidden',
         include_directories: incdir,
+        link_with: arm_vlibs,
         name_prefix: '',
         install: true,
         install_dir: install_dir,
