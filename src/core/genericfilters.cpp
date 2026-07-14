@@ -658,6 +658,26 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSVE(const VSVideoForma
     if (vs_sve_vector_length() <= 16)
         return nullptr;
 
+    // svdot_s64 word squares. SDOT folds 4 int16 products into a 64-bit lane, so
+    // its MAC density beats vmlal_s16 at any vector length -- but it accumulates
+    // into 64-bit lanes, so the scale/bias/round/clamp/narrow store is amortised
+    // over only svcntd() outputs (2 at a 128-bit VL, 4 at 256). That store cost is
+    // fixed per output and swamps the MAC saving unless the tap count is high,
+    // which is why this pays only from 7x7 up, and only on wide vectors:
+    //
+    //   Graviton3 (256-bit) vs NEON:  7x7 +17%, 9x9 +39%, 11x11 +57% (1 thread)
+    //                                 3x3 -19%, 5x5 -14%   -> left on the old kernels
+    //   Graviton4 (128-bit) vs NEON:  loses everywhere except 11x11 (parity), so
+    //                                 the VL gate above still sends it to NEON.
+    if (fi->sampleType == stInteger && fi->bytesPerSample == 2 && d->convolution_type == ConvolutionSquare) {
+        if (d->matrix_elements == 49)
+            return vs_generic_7x7_conv_word_sve_dot;
+        else if (d->matrix_elements == 81)
+            return vs_generic_9x9_conv_word_sve_dot;
+        else if (d->matrix_elements == 121)
+            return vs_generic_11x11_conv_word_sve_dot;
+    }
+
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
         // Where the usdot kernels apply they beat the lane-density SVE squares by
         // ~2x, so those step aside. SVE has its own usdot kernels (2x the outputs
