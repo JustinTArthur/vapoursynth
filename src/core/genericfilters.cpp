@@ -151,6 +151,7 @@ struct GenericDataExtra {
     float bias;
     bool saturate;
     bool conv_int8;   // all coefficients fit int8 -> byte square conv may take the VNNI path
+    bool conv_f16;    // all coefficients survive a round trip through half -> SME FMOPA is lossless
 
     int cpulevel;
     int corethreads;  // thread pool size at creation; steers the SME/NEON choice on ARM
@@ -804,8 +805,15 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         // threaded, and it still wins the bigger shapes on a full pool. 5x5 is the
         // exception -- it loses 3% at 16 threads -- and 3x3 has no SME kernel.
         //
-        // FMOPA takes both operands in f16, so the coefficients round to half:
-        // output error is 1 ulp of half against NEON's 0.5 ulp (measured, 9x9).
+        // FMOPA takes both operands in f16, so it is only correct to use where the
+        // coefficients survive that narrowing exactly (conv_f16) -- the same rule
+        // the VNNI byte path follows with conv_int8. Otherwise the coefficients
+        // would be silently degraded, which no other tier does, so those clips stay
+        // on NEON and its float32 coefficients. In practice the usual matrices are
+        // integers or dyadic fractions and pass the gate.
+        if (!d->conv_f16)
+            return nullptr;
+
         if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
             return vs_generic_7x7_conv_half_sme;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
@@ -1123,6 +1131,7 @@ static void VS_CC genericCreate(const VSMap *in, VSMap *out, void *userData, VSC
             float matrix_sumf = 0;
             const double *matrix = vsapi->mapGetFloatArray(in, "matrix", nullptr);
             d->conv_int8 = true;
+            d->conv_f16 = true;
             for (int i = 0; i < d->matrix_elements; i++) {
                 double c = matrix[i];
                 if (!std::isfinite(c))
@@ -1139,6 +1148,13 @@ static void VS_CC genericCreate(const VSMap *in, VSMap *out, void *userData, VSC
                 } else {
                     d->matrixf[i] = static_cast<float>(c);
                 }
+
+                // Kernels that must take their coefficients in a narrower type may
+                // only do so when the value survives the trip exactly -- same rule
+                // conv_int8 applies to the VNNI path. Rounding a coefficient to buy
+                // speed is not on the table.
+                if (halfToFloat(floatToHalf(d->matrixf[i])) != d->matrixf[i])
+                    d->conv_f16 = false;
 
                 matrix_sumf += d->matrixf[i];
             }
