@@ -665,14 +665,23 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSVE(const VSVideoForma
         // NEON tier. 3x3 has no usdot kernel, so plain SVE keeps it.
         if (convByteDot(d) && d->convolution_type == ConvolutionSquare && d->matrix_elements != 9) {
 #ifdef VS_TARGET_ARM_SVE_I8MM
-            if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
-                return vs_generic_5x5_conv_byte_sve_dot;
-            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            // The wider SVE vectors win single-threaded on every shape (5x5
+            // +18%, 7x7 +48%, 9x9 +24%, 11x11 +3%). On a full pool memory
+            // bandwidth binds and 11x11 falls 12% behind the NEON usdot kernel
+            // (Graviton3, stable across runs), while 7x7 keeps +22% and 9x9 +3%.
+            // 5x5's all-core delta is inside run-to-run noise -- benching the
+            // same kernel in both columns swings 7% -- so it is gated rather than
+            // trusted either way: SVE on a small pool, where its single-thread
+            // win is solid, NEON on a full one. Same thread gate as SME.
+            const bool few = d->corethreads <= 4;
+            if (d->matrix_elements == 49)
                 return vs_generic_7x7_conv_byte_sve_dot;
-            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            else if (d->matrix_elements == 81)
                 return vs_generic_9x9_conv_byte_sve_dot;
-            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
-                return vs_generic_11x11_conv_byte_sve_dot;
+            else if (d->matrix_elements == 25)
+                return few ? vs_generic_5x5_conv_byte_sve_dot : nullptr;
+            else if (d->matrix_elements == 121)
+                return few ? vs_generic_11x11_conv_byte_sve_dot : nullptr;
 #endif
             return nullptr;
         }
