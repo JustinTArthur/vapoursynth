@@ -757,6 +757,13 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         return nullptr;
 
     const CPUFeatures *cpu = getCPUFeatures();
+    // NB the <= 4 cutoff is not sharply validated. What is solid: SME wins these
+    // shapes decisively at 1-2 threads (3x3 byte +48%/+36%) and loses decisively on
+    // a full pool (3x3 byte 0.35x at 16), because the SME unit is shared per cluster.
+    // At exactly 4 threads the two tiers are indistinguishable on the M4 -- the
+    // run-to-run spread there is +-5-9%, wider than any difference between them --
+    // so the boundary sits somewhere in 4..8 and 4 is a reasonable, not a measured,
+    // place to put it. Re-measure with many more frames before moving it.
     const bool few_threads = d->corethreads <= 4;
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
