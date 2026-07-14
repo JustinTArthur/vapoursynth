@@ -357,6 +357,14 @@ DECL(2d_conv_sep, word, neon)
 DECL(2d_conv_sep, float, neon)
 DECL(2d_conv_sep, half, neon)
 
+#ifdef VS_TARGET_ARM_I8MM
+/* usdot byte square conv; valid only when every coefficient fits int8. */
+DECL(5x5_conv, byte, neon_dot)
+DECL(7x7_conv, byte, neon_dot)
+DECL(9x9_conv, byte, neon_dot)
+DECL(11x11_conv, byte, neon_dot)
+#endif /* VS_TARGET_ARM_I8MM */
+
 #ifdef VS_TARGET_ARM_SVE
 /* Non-streaming SVE (VLA) kernels; never built or dispatched on Apple silicon. */
 unsigned vs_sve_vector_length(void);

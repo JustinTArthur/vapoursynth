@@ -178,13 +178,23 @@ endif
 # mode -- keeping the whole TU streaming sidesteps that entirely.
 arm_have_sve = false
 arm_have_sme = false
+arm_have_i8mm = false
 if enable_arm_asm
     add_project_arguments('-DVS_TARGET_CPU_ARM64', language: ['c', 'cpp'])
 
     arm_fp16_args = ['-march=armv8.2-a+fp16']
     arm_dotprod_args = ['-march=armv8.2-a+dotprod']
+    arm_i8mm_args = ['-march=armv8.2-a+i8mm']
     arm_sve_args = ['-march=armv8.2-a+sve']
     arm_sme_args = ['-march=armv8.6-a+sme2+sme-i16i64']
+
+    arm_have_i8mm = cxx.compiles('''
+#include <arm_neon.h>
+int32x4_t f(int32x4_t a, uint8x16_t b, int8x16_t c) { return vusdotq_s32(a, b, c); }
+''',
+        args: arm_i8mm_args,
+        name: 'AArch64 i8mm usdot intrinsics',
+    )
 
     if host_system != 'darwin'
         arm_have_sve = cxx.compiles('''
@@ -209,6 +219,9 @@ __arm_locally_streaming __arm_new("za") void f(const int16_t *p) {
         name: 'AArch64 SME2 streaming intrinsics',
     )
 
+    if arm_have_i8mm
+        add_project_arguments('-DVS_TARGET_ARM_I8MM', language: ['c', 'cpp'])
+    endif
     if arm_have_sve
         add_project_arguments('-DVS_TARGET_ARM_SVE', language: ['c', 'cpp'])
     endif
@@ -455,6 +468,16 @@ else
             'src/core/kernel/arm/lut_neon.cpp',
             'src/core/kernel/arm/square_neon.cpp',
         )
+        if arm_have_i8mm
+            # usdot byte square conv. Its own TU so the NEON baseline sources are
+            # never built with +i8mm.
+            arm_vlibs += static_library('vsfilters_i8mm',
+                files('src/core/kernel/arm/square_dot_neon.cpp'),
+                cpp_args: arm_i8mm_args,
+                gnu_symbol_visibility: 'hidden',
+                include_directories: incdir,
+            )
+        endif
         if arm_have_sve
             arm_vlibs += static_library('vsfilters_sve',
                 files('src/core/kernel/arm/convolution_sve.cpp'),

@@ -536,6 +536,19 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSSE2(const VSVideoForm
 #endif
 
 #ifdef VS_TARGET_CPU_ARM64
+// The byte square usdot kernels are bit-exact fast paths, valid only when every
+// coefficient fits int8 and the CPU reports i8mm (the ARM analog of convByteVNNI).
+// They are ~2-3.5x the vmlal kernels, which rewrites the SVE and SME byte square
+// policies below -- but only where they actually apply, so wide-coefficient
+// convolutions keep the old (still correct) tier choices.
+#ifdef VS_TARGET_ARM_I8MM
+static bool convByteDot(const GenericData *d) {
+    return d->conv_int8 && getCPUFeatures()->i8mm;
+}
+#else
+static bool convByteDot(const GenericData *) { return false; }
+#endif
+
 // Only the convolution family has hand-written ARM kernels; every other op
 // falls through to the (auto-vectorised) C tier.
 template <GenericOperations op>
@@ -544,6 +557,20 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectNEON(const VSVideoForm
         return nullptr;
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+#ifdef VS_TARGET_ARM_I8MM
+        // usdot folds 4 taps per op with no byte->word widening; bit-exact with
+        // the vmlal kernels, but only valid when every coefficient fits int8.
+        if (convByteDot(d)) {
+            if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+                return vs_generic_5x5_conv_byte_neon_dot;
+            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+                return vs_generic_7x7_conv_byte_neon_dot;
+            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+                return vs_generic_9x9_conv_byte_neon_dot;
+            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+                return vs_generic_11x11_conv_byte_neon_dot;
+        }
+#endif
         if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
             return vs_generic_3x3_conv_byte_neon;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
@@ -632,6 +659,13 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSVE(const VSVideoForma
         return nullptr;
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+        // 5x5..11x11 byte squares only when the usdot kernels are unavailable:
+        // where they do apply they beat these by ~2x on Graviton3, so SVE must
+        // step aside and let the NEON tier take the shape. 3x3 has no usdot
+        // kernel, so SVE keeps it.
+        if (convByteDot(d) && d->convolution_type == ConvolutionSquare && d->matrix_elements != 9)
+            return nullptr;
+
         if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
             return vs_generic_3x3_conv_byte_sve;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
@@ -685,6 +719,22 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
     const bool few_threads = d->corethreads <= 4;
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+        // With the usdot kernels in play the byte square picture inverts (M4):
+        // NEON wins 5x5 and 7x7 outright even single-threaded, and wins every
+        // shape once the pool is full, because SME is a shared per-cluster unit
+        // while usdot scales per core. SME survives only on 9x9/11x11 on a small
+        // pool (single thread: 758 vs 585, 564 vs 478 fps). Without usdot the
+        // original policy still holds.
+        if (convByteDot(d) && d->convolution_type == ConvolutionSquare) {
+            if (!few_threads)
+                return nullptr;
+            if (d->matrix_elements == 81)
+                return vs_generic_9x9_conv_byte_sme;
+            else if (d->matrix_elements == 121)
+                return vs_generic_11x11_conv_byte_sme;
+            return nullptr;
+        }
+
         if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
             return few_threads ? vs_generic_5x5_conv_byte_sme : nullptr;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
