@@ -397,6 +397,14 @@ DECL(1d_conv_v, float, sve)
 DECL(2d_conv_sep, byte, sve)
 DECL(2d_conv_sep, word, sve)
 DECL(2d_conv_sep, float, sve)
+#ifdef VS_TARGET_ARM_SVE_I8MM
+/* SVE usdot byte square conv; needs SVE + I8MM and pays only above 128-bit VL. */
+DECL(5x5_conv, byte, sve_dot)
+DECL(7x7_conv, byte, sve_dot)
+DECL(9x9_conv, byte, sve_dot)
+DECL(11x11_conv, byte, sve_dot)
+#endif /* VS_TARGET_ARM_SVE_I8MM */
+
 #endif /* VS_TARGET_ARM_SVE */
 
 #ifdef VS_TARGET_ARM_SME

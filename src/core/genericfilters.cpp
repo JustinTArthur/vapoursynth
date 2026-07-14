@@ -659,12 +659,23 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSVE(const VSVideoForma
         return nullptr;
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
-        // 5x5..11x11 byte squares only when the usdot kernels are unavailable:
-        // where they do apply they beat these by ~2x on Graviton3, so SVE must
-        // step aside and let the NEON tier take the shape. 3x3 has no usdot
-        // kernel, so SVE keeps it.
-        if (convByteDot(d) && d->convolution_type == ConvolutionSquare && d->matrix_elements != 9)
+        // Where the usdot kernels apply they beat the lane-density SVE squares by
+        // ~2x, so those step aside. SVE has its own usdot kernels (2x the outputs
+        // per op at a 256-bit VL); prefer them, and otherwise fall through to the
+        // NEON tier. 3x3 has no usdot kernel, so plain SVE keeps it.
+        if (convByteDot(d) && d->convolution_type == ConvolutionSquare && d->matrix_elements != 9) {
+#ifdef VS_TARGET_ARM_SVE_I8MM
+            if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+                return vs_generic_5x5_conv_byte_sve_dot;
+            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+                return vs_generic_7x7_conv_byte_sve_dot;
+            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+                return vs_generic_9x9_conv_byte_sve_dot;
+            else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+                return vs_generic_11x11_conv_byte_sve_dot;
+#endif
             return nullptr;
+        }
 
         if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
             return vs_generic_3x3_conv_byte_sve;

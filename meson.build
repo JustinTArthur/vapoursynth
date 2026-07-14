@@ -186,6 +186,7 @@ if enable_arm_asm
     arm_dotprod_args = ['-march=armv8.2-a+dotprod']
     arm_i8mm_args = ['-march=armv8.2-a+i8mm']
     arm_sve_args = ['-march=armv8.2-a+sve']
+    arm_sve_i8mm_args = ['-march=armv8.2-a+sve+i8mm']
     arm_sme_args = ['-march=armv8.6-a+sme2+sme-i16i64']
 
     arm_have_i8mm = cxx.compiles('''
@@ -196,6 +197,7 @@ int32x4_t f(int32x4_t a, uint8x16_t b, int8x16_t c) { return vusdotq_s32(a, b, c
         name: 'AArch64 i8mm usdot intrinsics',
     )
 
+    arm_have_sve_i8mm = false
     if host_system != 'darwin'
         arm_have_sve = cxx.compiles('''
 #include <arm_sve.h>
@@ -204,6 +206,15 @@ svfloat32_t f(svfloat32_t a, svfloat32_t b) { return svmla_f32_x(svptrue_b32(), 
             args: arm_sve_args,
             name: 'AArch64 non-streaming SVE intrinsics',
         )
+        if arm_have_sve
+            arm_have_sve_i8mm = cxx.compiles('''
+#include <arm_sve.h>
+svint32_t f(svint32_t a, svuint8_t b, svint8_t c) { return svusdot_s32(a, b, c); }
+''',
+                args: arm_sve_i8mm_args,
+                name: 'AArch64 SVE i8mm usdot intrinsics',
+            )
+        endif
     endif
 
     arm_have_sme = cxx.compiles('''
@@ -224,6 +235,9 @@ __arm_locally_streaming __arm_new("za") void f(const int16_t *p) {
     endif
     if arm_have_sve
         add_project_arguments('-DVS_TARGET_ARM_SVE', language: ['c', 'cpp'])
+    endif
+    if arm_have_sve_i8mm
+        add_project_arguments('-DVS_TARGET_ARM_SVE_I8MM', language: ['c', 'cpp'])
     endif
     if arm_have_sme
         add_project_arguments('-DVS_TARGET_ARM_SME', language: ['c', 'cpp'])
@@ -482,6 +496,16 @@ else
             arm_vlibs += static_library('vsfilters_sve',
                 files('src/core/kernel/arm/convolution_sve.cpp'),
                 cpp_args: arm_sve_args,
+                gnu_symbol_visibility: 'hidden',
+                include_directories: incdir,
+            )
+        endif
+        if arm_have_sve_i8mm
+            # A CPU may have SVE without I8MM (A64FX), so these live apart from
+            # the plain SVE kernels.
+            arm_vlibs += static_library('vsfilters_sve_i8mm',
+                files('src/core/kernel/arm/square_dot_sve.cpp'),
+                cpp_args: arm_sve_i8mm_args,
                 gnu_symbol_visibility: 'hidden',
                 include_directories: incdir,
             )
