@@ -760,6 +760,13 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
     const bool few_threads = d->corethreads <= 4;
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
+        // 3x3 was assumed too small for the band to pay. It does pay, but only on a
+        // small pool: single-threaded it is +34% (byte) / +64% (float) / +10% (half),
+        // while at 16 threads the shared SME unit becomes the bottleneck for so cheap
+        // a shape and it collapses (byte 5959 vs 17237 fps). word loses even at one
+        // thread (-9%) and never takes it.
+        if (few_threads && d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_byte_sme;
         // With the usdot kernels in play the byte square picture inverts (M4):
         // NEON wins 5x5 and 7x7 outright even single-threaded, and wins every
         // shape once the pool is full, because SME is a shared per-cluster unit
@@ -814,7 +821,9 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         if (!d->conv_f16)
             return nullptr;
 
-        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+        if (few_threads && d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_half_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
             return vs_generic_7x7_conv_half_sme;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
             return vs_generic_9x9_conv_half_sme;
@@ -825,7 +834,9 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         else if (d->convolution_type == ConvolutionVertical)
             return vs_generic_1d_conv_v_half_sme;
     } else if (fi->sampleType == stFloat && fi->bytesPerSample == 4) {
-        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+        if (few_threads && d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+            return vs_generic_3x3_conv_float_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
             return vs_generic_5x5_conv_float_sme;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
             return vs_generic_7x7_conv_float_sme;
