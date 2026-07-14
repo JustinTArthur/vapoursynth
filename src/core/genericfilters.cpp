@@ -799,18 +799,23 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         else if (d->convolution_type == ConvolutionVertical)
             return vs_generic_1d_conv_v_word_sme;
     } else if (fi->sampleType == stFloat && fi->bytesPerSample == 2) {
-        // half reuses the f32 ZA path by widening its samples, which costs a
-        // zero-extending halfword load plus a convert per MOPA operand where
-        // float does one svld1_f32. That load-side overhead eats most of the
-        // outer-product win, so unlike float only the two shapes that still come
-        // out ahead are taken: 11x11 (1.35x single-thread, 1.17x at 16) and
-        // vertical 1D (1.32x single-thread, but it inverts on a full pool).
-        // Native 2-way f16 FMOPA would avoid the widening entirely; until then
-        // 5x5/7x7/9x9 stay on NEON, where they are faster.
-        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
+        // Native 2-way f16 FMOPA: one outer product folds two source rows, and the
+        // pixels are consumed as f16 with no widening load. 2.4-5.1x NEON single
+        // threaded, and it still wins the bigger shapes on a full pool. 5x5 is the
+        // exception -- it loses 3% at 16 threads -- and 3x3 has no SME kernel.
+        //
+        // FMOPA takes both operands in f16, so the coefficients round to half:
+        // output error is 1 ulp of half against NEON's 0.5 ulp (measured, 9x9).
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+            return vs_generic_7x7_conv_half_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
+            return vs_generic_9x9_conv_half_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
             return vs_generic_11x11_conv_half_sme;
+        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
+            return few_threads ? vs_generic_5x5_conv_half_sme : nullptr;
         else if (d->convolution_type == ConvolutionVertical)
-            return few_threads ? vs_generic_1d_conv_v_half_sme : nullptr;
+            return vs_generic_1d_conv_v_half_sme;
     } else if (fi->sampleType == stFloat && fi->bytesPerSample == 4) {
         if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 25)
             return vs_generic_5x5_conv_float_sme;

@@ -84,6 +84,17 @@ inline void mopa32_f32(unsigned t, svbool_t pn, svbool_t pm, svfloat32_t zn, svf
 }
 
 __attribute__((always_inline))
+inline void mopa32_f16(unsigned t, svbool_t pn, svbool_t pm, svfloat16_t zn, svfloat16_t zm) __arm_streaming __arm_inout("za")
+{
+    switch (t) {
+    case 0: svmopa_za32_f16_m(0, pn, pm, zn, zm); break;
+    case 1: svmopa_za32_f16_m(1, pn, pm, zn, zm); break;
+    case 2: svmopa_za32_f16_m(2, pn, pm, zn, zm); break;
+    default: svmopa_za32_f16_m(3, pn, pm, zn, zm); break;
+    }
+}
+
+__attribute__((always_inline))
 inline void mopa64_i16(unsigned t, svbool_t pn, svbool_t pm, svint16_t zn, svint16_t zm) __arm_streaming __arm_inout("za")
 {
     switch (t) {
@@ -277,20 +288,108 @@ void sme_sq_int64_interior(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t d
     }
 }
 
-// ---- half (binary16) <-> float32 -----------------------------------------------
-// A half sample sits in the bottom 16 bits of its 32-bit container, so a
-// zero-extending halfword load followed by svcvt yields svcntw() floats from
-// svcntw() consecutive halves -- the f32 ZA path is then reused verbatim, which
-// is what lifts half off the NEON fallback.
-
-inline svfloat32_t ld_half_f32(svbool_t pg, const uint16_t *p) __arm_streaming
-{
-    return svcvt_f32_f16_x(pg, svreinterpret_f16_u32(svld1uh_u32(pg, p)));
-}
+// ---- half (binary16) store ----------------------------------------------------
+// ZA accumulates in f32; a half sample sits in the bottom 16 bits of its 32-bit
+// container, so svcvt + a narrowing halfword store writes svcntw() halves.
 
 inline void st_f32_half(svbool_t pg, uint16_t *p, svfloat32_t f) __arm_streaming
 {
     svst1h_u32(pg, p, svreinterpret_u32_f16(svcvt_f16_f32_x(pg, f)));
+}
+
+// ---- square NxN, half, native 2-way f16 FMOPA ---------------------------------
+//
+// The widening FMOPA reduces over adjacent element pairs:
+//     ZA32[i][j] += Zn.h[2i]*Zm.h[2j] + Zn.h[2i+1]*Zm.h[2j+1]
+// so one instruction folds *two* source rows into the tile instead of one, which
+// halves the outer-product count versus the f32 path, and the pixels are consumed
+// as f16 with no widening load and no convert.
+//
+// The pairing is over source rows: for pair dp, element 2j of Zm is the pixel from
+// row 2dp and element 2j+1 the pixel from row 2dp+1, at the same column -- exactly
+// svzip1_f16 of two ordinary row loads. The band is pre-interleaved to match
+// (element 2i+p holds the coefficient for source row 2dp+p, output row i), so the
+// odd element of a trailing unpaired row is simply zero and the phantom row reads
+// harmlessly from its partner.
+//
+// PRECISION: FMOPA takes both operands in f16, so the coefficients are rounded to
+// half here, where every other tier (C, NEON, x86) keeps them in float32. Products
+// are still exact in f32 (an f16*f16 product fits the f32 mantissa) and ZA
+// accumulates in f32, so the only loss is that coefficient rounding: ~2^-11
+// relative, roughly one ulp of the half output.
+
+std::vector<uint16_t> build_sq_band_f16(const float *m, unsigned N, unsigned TR)
+{
+    const unsigned nd = TR + N - 1;
+    const unsigned npair = (nd + 1) / 2;
+    std::vector<uint16_t> band(static_cast<size_t>(npair) * N * 2 * TR, 0);
+    for (unsigned dp = 0; dp < npair; ++dp) {
+        for (unsigned k = 0; k < N; ++k) {
+            uint16_t *b = band.data() + (static_cast<size_t>(dp) * N + k) * 2 * TR;
+            for (unsigned i = 0; i < TR; ++i) {
+                for (unsigned p = 0; p < 2; ++p) {
+                    const int r = static_cast<int>(2 * dp + p) - static_cast<int>(i);
+                    const float c = (r >= 0 && r < static_cast<int>(N)) ? m[static_cast<unsigned>(r) * N + k] : 0.0f;
+                    b[2 * i + p] = nc_float_to_half(c);
+                }
+            }
+        }
+    }
+    return band;
+}
+
+__arm_locally_streaming __arm_new("za")
+void sme_sq_half_fmopa_interior(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
+                                const uint16_t *band, unsigned N, unsigned W, unsigned H,
+                                float div, float fbias, uint32_t satmask)
+{
+    const unsigned S = N / 2;
+    const unsigned TR = static_cast<unsigned>(svcntw());
+    const unsigned Wend = W - S;
+    const svbool_t pt32 = svptrue_b32();
+    const svbool_t pt16 = svptrue_b16();
+
+    for (unsigned y = 0; y < H; y += TR) {
+        const unsigned vr = std::min(TR, H - y);
+        const unsigned nrows = vr + N - 1;
+        const unsigned npair = (nrows + 1) / 2;
+        for (unsigned cb = S; cb < Wend; cb += 4 * TR) {
+            unsigned v[4];
+            for (unsigned t = 0; t < 4; ++t) {
+                unsigned base = cb + t * TR;
+                v[t] = base < Wend ? std::min(TR, Wend - base) : 0;
+            }
+            svzero_za();
+            for (unsigned dp = 0; dp < npair; ++dp) {
+                const unsigned d0 = 2 * dp, d1 = d0 + 1;
+                const uint16_t *r0 = reinterpret_cast<const uint16_t *>(rows[y + d0]);
+                // Trailing odd row: its band coefficients are zero, so pointing at
+                // the partner keeps the load in bounds and contributes nothing.
+                const uint16_t *r1 = d1 < nrows ? reinterpret_cast<const uint16_t *>(rows[y + d1]) : r0;
+                for (unsigned k = 0; k < N; ++k) {
+                    svfloat16_t zn = svld1_f16(pt16, reinterpret_cast<const float16_t *>(band + (static_cast<size_t>(dp) * N + k) * 2 * TR));
+                    for (unsigned t = 0; t < 4 && v[t]; ++t) {
+                        const svbool_t pld = svwhilelt_b16_u32(0u, v[t]);
+                        const svbool_t pcol = svwhilelt_b16_u32(0u, 2u * v[t]);
+                        const unsigned off = cb + t * TR + k - S;
+                        svfloat16_t a = svld1_f16(pld, reinterpret_cast<const float16_t *>(r0 + off));
+                        svfloat16_t b = svld1_f16(pld, reinterpret_cast<const float16_t *>(r1 + off));
+                        mopa32_f16(t, pt16, pcol, zn, svzip1_f16(a, b));
+                    }
+                }
+            }
+            for (unsigned i = 0; i < vr; ++i) {
+                uint16_t *drow = reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i) * ds);
+                for (unsigned t = 0; t < 4 && v[t]; ++t) {
+                    const svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
+                    svfloat32_t f = read_za32_f32(t, i);
+                    f = svmad_n_f32_x(pt32, f, svdup_f32(div), fbias);
+                    f = svreinterpret_f32_u32(svand_n_u32_x(pt32, svreinterpret_u32_f32(f), satmask));
+                    st_f32_half(pgw, drow + cb + t * TR, f);
+                }
+            }
+        }
+    }
 }
 
 // ---- square NxN, float, ZA32 FMOPA --------------------------------------------
@@ -339,51 +438,6 @@ void sme_sq_float_interior(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t d
     }
 }
 
-// ---- square NxN, half, ZA32 FMOPA (samples widen to f32) ----------------------
-
-__arm_locally_streaming __arm_new("za")
-void sme_sq_half_interior(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
-                           const float *band, unsigned N, unsigned W, unsigned H,
-                           float div, float fbias, uint32_t satmask)
-{
-    const unsigned S = N / 2;
-    const unsigned TR = static_cast<unsigned>(svcntw());
-    const unsigned Wend = W - S;
-    const svbool_t pt32 = svptrue_b32();
-
-    for (unsigned y = 0; y < H; y += TR) {
-        unsigned vr = std::min(TR, H - y);
-        for (unsigned cb = S; cb < Wend; cb += 4 * TR) {
-            unsigned v[4];
-            for (unsigned t = 0; t < 4; ++t) {
-                unsigned base = cb + t * TR;
-                v[t] = base < Wend ? std::min(TR, Wend - base) : 0;
-            }
-            svzero_za();
-            for (unsigned d = 0; d < vr + N - 1; ++d) {
-                const uint16_t *row = reinterpret_cast<const uint16_t *>(rows[y + d]);
-                for (unsigned k = 0; k < N; ++k) {
-                    svfloat32_t zn = svld1_f32(pt32, band + (static_cast<size_t>(d) * N + k) * TR);
-                    for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                        svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
-                        svfloat32_t zm = ld_half_f32(pgw, row + cb + t * TR + k - S);
-                        mopa32_f32(t, pt32, pgw, zn, zm);
-                    }
-                }
-            }
-            for (unsigned i = 0; i < vr; ++i) {
-                uint16_t *drow = reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i) * ds);
-                for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                    svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
-                    svfloat32_t f = read_za32_f32(t, i);
-                    f = svmad_n_f32_x(pt32, f, svdup_f32(div), fbias);
-                    f = svreinterpret_f32_u32(svand_n_u32_x(pt32, svreinterpret_u32_f32(f), satmask));
-                    st_f32_half(pgw, drow + cb + t * TR, f);
-                }
-            }
-        }
-    }
-}
 
 // ---- vertical 1D, int paths, ZA32 ---------------------------------------------
 
@@ -473,17 +527,38 @@ void sme_v_float_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
     }
 }
 
+std::vector<uint16_t> build_v_band_f16(const float *m, unsigned fwidth, unsigned TR)
+{
+    const unsigned nd = TR + fwidth - 1;
+    const unsigned npair = (nd + 1) / 2;
+    std::vector<uint16_t> band(static_cast<size_t>(npair) * 2 * TR, 0);
+    for (unsigned dp = 0; dp < npair; ++dp) {
+        uint16_t *b = band.data() + static_cast<size_t>(dp) * 2 * TR;
+        for (unsigned i = 0; i < TR; ++i) {
+            for (unsigned p = 0; p < 2; ++p) {
+                const int r = static_cast<int>(2 * dp + p) - static_cast<int>(i);
+                const float c = (r >= 0 && r < static_cast<int>(fwidth)) ? m[r] : 0.0f;
+                b[2 * i + p] = nc_float_to_half(c);
+            }
+        }
+    }
+    return band;
+}
+
+// Vertical 1D, native f16 FMOPA: same row-pairing as the square kernel.
 __arm_locally_streaming __arm_new("za")
-void sme_v_half_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
-                       const float *band, unsigned fwidth, unsigned W, unsigned H,
-                       float div, float fbias, uint32_t satmask)
+void sme_v_half_fmopa_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
+                            const uint16_t *band, unsigned fwidth, unsigned W, unsigned H,
+                            float div, float fbias, uint32_t satmask)
 {
     const unsigned TR = static_cast<unsigned>(svcntw());
     const svbool_t pt32 = svptrue_b32();
+    const svbool_t pt16 = svptrue_b16();
 
     for (unsigned y = 0; y < H; y += TR) {
-        unsigned vr = std::min(TR, H - y);
-        unsigned nrows = vr + fwidth - 1;
+        const unsigned vr = std::min(TR, H - y);
+        const unsigned nrows = vr + fwidth - 1;
+        const unsigned npair = (nrows + 1) / 2;
         for (unsigned cb = 0; cb < W; cb += 4 * TR) {
             unsigned v[4];
             for (unsigned t = 0; t < 4; ++t) {
@@ -491,18 +566,24 @@ void sme_v_half_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
                 v[t] = base < W ? std::min(TR, W - base) : 0;
             }
             svzero_za();
-            for (unsigned d = 0; d < nrows; ++d) {
-                svfloat32_t zn = svld1_f32(pt32, band + static_cast<size_t>(d) * TR);
-                const uint16_t *row = reinterpret_cast<const uint16_t *>(rows[y + d]);
+            for (unsigned dp = 0; dp < npair; ++dp) {
+                const unsigned d0 = 2 * dp, d1 = d0 + 1;
+                const uint16_t *r0 = reinterpret_cast<const uint16_t *>(rows[y + d0]);
+                const uint16_t *r1 = d1 < nrows ? reinterpret_cast<const uint16_t *>(rows[y + d1]) : r0;
+                svfloat16_t zn = svld1_f16(pt16, reinterpret_cast<const float16_t *>(band + static_cast<size_t>(dp) * 2 * TR));
                 for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                    svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
-                    mopa32_f32(t, pt32, pgw, zn, ld_half_f32(pgw, row + cb + t * TR));
+                    const svbool_t pld = svwhilelt_b16_u32(0u, v[t]);
+                    const svbool_t pcol = svwhilelt_b16_u32(0u, 2u * v[t]);
+                    const unsigned off = cb + t * TR;
+                    svfloat16_t a = svld1_f16(pld, reinterpret_cast<const float16_t *>(r0 + off));
+                    svfloat16_t b = svld1_f16(pld, reinterpret_cast<const float16_t *>(r1 + off));
+                    mopa32_f16(t, pt16, pcol, zn, svzip1_f16(a, b));
                 }
             }
             for (unsigned i = 0; i < vr; ++i) {
                 uint16_t *drow = reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i) * ds);
                 for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                    svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
+                    const svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
                     svfloat32_t f = read_za32_f32(t, i);
                     f = svmad_n_f32_x(pt32, f, svdup_f32(div), fbias);
                     f = svreinterpret_f32_u32(svand_n_u32_x(pt32, svreinterpret_u32_f32(f), satmask));
@@ -512,6 +593,7 @@ void sme_v_half_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
         }
     }
 }
+
 
 // ---- non-streaming wrappers ----------------------------------------------------
 
@@ -641,8 +723,8 @@ void sme_sq_plane(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
             sme_sq_float_interior(rows.data(), static_cast<uint8_t *>(dst), ds, band.data(), N, W, H, p.div, p.bias, satmask);
         } else if constexpr (TY == SmeType::Half) {
             unsigned TR = static_cast<unsigned>(svcntsw());
-            std::vector<float> band = build_sq_band_f32(p.matrixf, N, TR);
-            sme_sq_half_interior(rows.data(), static_cast<uint8_t *>(dst), ds, band.data(), N, W, H, p.div, p.bias, satmask);
+            std::vector<uint16_t> band = build_sq_band_f16(p.matrixf, N, TR);
+            sme_sq_half_fmopa_interior(rows.data(), static_cast<uint8_t *>(dst), ds, band.data(), N, W, H, p.div, p.bias, satmask);
         } else if (TY == SmeType::Word && N > 7) {
             unsigned TD = static_cast<unsigned>(svcntsd());
             std::vector<int16_t> band = build_sq_band_i16(p.matrix, N, TD, 4);
@@ -704,8 +786,8 @@ void sme_v_plane(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
         std::vector<float> band = build_v_band_f32(p.matrixf, fwidth, TR);
         sme_v_float_plane(rows.data(), static_cast<uint8_t *>(dst), ds, band.data(), fwidth, W, H, p.div, p.bias, satmask);
     } else if constexpr (TY == SmeType::Half) {
-        std::vector<float> band = build_v_band_f32(p.matrixf, fwidth, TR);
-        sme_v_half_plane(rows.data(), static_cast<uint8_t *>(dst), ds, band.data(), fwidth, W, H, p.div, p.bias, satmask);
+        std::vector<uint16_t> band = build_v_band_f16(p.matrixf, fwidth, TR);
+        sme_v_half_fmopa_plane(rows.data(), static_cast<uint8_t *>(dst), ds, band.data(), fwidth, W, H, p.div, p.bias, satmask);
     } else {
         std::vector<int16_t> band = build_v_band_i16(p.matrix, fwidth, TR);
         int32_t wb = 0;
