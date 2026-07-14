@@ -416,8 +416,16 @@ void vs_lut2_gather_wb_b_avx512(const uint16_t *, const uint8_t *, uint8_t *, in
 void vs_lut2_gather_bw_w_avx512(const uint8_t *, const uint16_t *, uint16_t *, int, const uint16_t *, int, unsigned, unsigned);
 void vs_lut2_gather_bw_b_avx512(const uint8_t *, const uint16_t *, uint8_t *, int, const uint8_t *, int, unsigned, unsigned);
 #endif
+#if defined(VS_TARGET_CPU_ARM64) && defined(VS_TARGET_ARM_SVE)
+void vs_lut2_gather_ww_w_sve(const uint16_t *, const uint16_t *, uint16_t *, int, const uint16_t *, int, unsigned, unsigned);
+void vs_lut2_gather_ww_b_sve(const uint16_t *, const uint16_t *, uint8_t *, int, const uint8_t *, int, unsigned, unsigned);
+void vs_lut2_gather_wb_w_sve(const uint16_t *, const uint8_t *, uint16_t *, int, const uint16_t *, int, unsigned, unsigned);
+void vs_lut2_gather_wb_b_sve(const uint16_t *, const uint8_t *, uint8_t *, int, const uint8_t *, int, unsigned, unsigned);
+void vs_lut2_gather_bw_w_sve(const uint8_t *, const uint16_t *, uint16_t *, int, const uint16_t *, int, unsigned, unsigned);
+void vs_lut2_gather_bw_b_sve(const uint8_t *, const uint16_t *, uint8_t *, int, const uint8_t *, int, unsigned, unsigned);
+#endif
 
-/* Dispatch one row to the AVX-512 gather kernel for the current type combo.
+/* Dispatch one row to the gather kernel for the current type combo.
    Returns false (compile-time) for combos without a kernel so the caller falls
    back to the scalar path; only ever called when d->use_gather is set. */
 template<typename T, typename U, typename V>
@@ -435,6 +443,22 @@ static inline bool lut2GatherRow(const T *sx, const U *sy, V *d, int w, const V 
         } else if constexpr (std::is_same_v<T, uint8_t> && std::is_same_v<U, uint16_t>) {
             if constexpr (sizeof(V) == 2) vs_lut2_gather_bw_w_avx512(sx, sy, d, w, lut, bitsx, mx, my);
             else vs_lut2_gather_bw_b_avx512(sx, sy, d, w, lut, bitsx, mx, my);
+            return true;
+        }
+    }
+#elif defined(VS_TARGET_CPU_ARM64) && defined(VS_TARGET_ARM_SVE)
+    if constexpr (std::is_integral_v<V>) {
+        if constexpr (std::is_same_v<T, uint16_t> && std::is_same_v<U, uint16_t>) {
+            if constexpr (sizeof(V) == 2) vs_lut2_gather_ww_w_sve(sx, sy, d, w, lut, bitsx, mx, my);
+            else vs_lut2_gather_ww_b_sve(sx, sy, d, w, lut, bitsx, mx, my);
+            return true;
+        } else if constexpr (std::is_same_v<T, uint16_t> && std::is_same_v<U, uint8_t>) {
+            if constexpr (sizeof(V) == 2) vs_lut2_gather_wb_w_sve(sx, sy, d, w, lut, bitsx, mx, my);
+            else vs_lut2_gather_wb_b_sve(sx, sy, d, w, lut, bitsx, mx, my);
+            return true;
+        } else if constexpr (std::is_same_v<T, uint8_t> && std::is_same_v<U, uint16_t>) {
+            if constexpr (sizeof(V) == 2) vs_lut2_gather_bw_w_sve(sx, sy, d, w, lut, bitsx, mx, my);
+            else vs_lut2_gather_bw_b_sve(sx, sy, d, w, lut, bitsx, mx, my);
             return true;
         }
     }
@@ -596,6 +620,33 @@ static void lut2CreateHelper(const VSMap *in, VSMap *out, VSFunction *func, std:
     if constexpr (std::is_integral_v<V>) {
         if (getCPUFeatures()->avx512 && d->cpulevel >= VS_CPU_LEVEL_AVX512 && (size_t)inrange * sizeof(V) >= (512u << 10))
             d->use_gather = true;
+    }
+#elif defined(VS_TARGET_CPU_ARM64) && defined(VS_TARGET_ARM_SVE)
+    /* A gather retires svcntw() lookups, so what it wins scales with vector length;
+       what it has to beat is a scalar path whose table lookups are cheap while the
+       table stays in cache. Those two effects split the gate.
+
+       At 128 bits a gather is only 4 lookups and does not pay on its own -- it needs
+       the table to spill L2, where its several outstanding misses beat the scalar
+       loop's one. Measured on Graviton4 (Neoverse-V2, 2 MB L2), single thread, table
+       size swept with the kernel held fixed:
+
+         table    512 KB   1 MB   2 MB
+         word dst   0.87   1.63   1.58
+         byte dst   0.90   1.52     --     (256 KB: 0.92)
+
+       The break-even is the table's size in bytes, not its entry count: 2^19 entries
+       wins as a word table (1 MB) and loses as a byte one (512 KB). So on 128-bit
+       hardware a gather is only used from 1 MB up.
+
+       At 256 bits it is 8 lookups per gather and pays at every size Lut2 can reach
+       (Graviton3, Neoverse-V1, 1 MB L2, single thread: 1.56x-2.17x from 256 KB to
+       2 MB), so there is nothing to gate on but the vector length. */
+    if constexpr (std::is_integral_v<V>) {
+        if (getCPUFeatures()->sve && d->cpulevel >= VS_CPU_LEVEL_SVE) {
+            if (vs_sve_vector_length() > 16 || (size_t)inrange * sizeof(V) >= (1u << 20))
+                d->use_gather = true;
+        }
     }
 #endif
 

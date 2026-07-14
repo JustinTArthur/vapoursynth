@@ -44,6 +44,7 @@
 
 #include <arm_sve.h>
 #include <cstdint>
+#include <type_traits>
 
 void vs_lut1_w_w_sve(const uint16_t *src, uint16_t *dst, int w, const uint16_t *lut)
 {
@@ -69,3 +70,75 @@ void vs_lut1_w_b_sve(const uint16_t *src, uint8_t *dst, int w, const uint8_t *lu
         svst1b_u32(pg, dst + i, v);
     }
 }
+
+/*
+* SVE gather Lut2.
+*
+* Lut2 indexes a 2D table with a pixel from each source clip:
+*
+*   dst[x] = lut[(min(sy[x], my) << bitsx) + min(sx[x], mx)]
+*
+* which is the scalar path verbatim, one lane at a time. Unlike Lut1, whose byte
+* destination packs 8 lookups into a uint64 and stores once, the Lut2 scalar path
+* is a plain per-pixel loop for every destination width, so there is more headroom
+* here than there was for Lut1.
+*
+* The combos mirror the AVX-512 ones: both sources 16-bit (ww), or one of the two
+* 8-bit (wb, bw), each with a word or byte destination. Two 8-bit sources are left
+* scalar -- Lut2 caps the total indexing bits at 20, so a byte/byte table is at most
+* 65536 entries (128 KB) and stays resident in L2, where a gather has nothing to
+* recover. x86 declines that combo for the same reason.
+*
+* Bit-exact by construction, and predicated on svwhilelt rather than relying on row
+* padding, so the width tail needs no scalar cleanup and nothing is read out of bounds.
+*/
+
+namespace {
+
+template<typename T>
+inline svuint32_t load_widen(svbool_t pg, const T *p)
+{
+    if constexpr (sizeof(T) == 1)
+        return svld1ub_u32(pg, p);
+    else
+        return svld1uh_u32(pg, p);
+}
+
+template<typename V>
+inline void gather_store(svbool_t pg, V *d, const V *lut, svuint32_t idx)
+{
+    if constexpr (sizeof(V) == 2) {
+        // 16-bit table entries are scaled by the index form.
+        svst1h_u32(pg, d, svld1uh_gather_u32index_u32(pg, lut, idx));
+    } else {
+        // byte elements need no index scaling, so this is the offset form.
+        svst1b_u32(pg, d, svld1ub_gather_u32offset_u32(pg, lut, idx));
+    }
+}
+
+template<typename T, typename U, typename V>
+inline void lut2_gather(const T *sx, const U *sy, V *d, int w, const V *lut, int bitsx, unsigned mx, unsigned my)
+{
+    const unsigned n = static_cast<unsigned>(w);
+    const unsigned step = static_cast<unsigned>(svcntw());
+    const svuint32_t vmx = svdup_u32(mx);
+    const svuint32_t vmy = svdup_u32(my);
+    const svuint32_t vsh = svdup_u32(static_cast<unsigned>(bitsx));
+
+    for (unsigned i = 0; i < n; i += step) {
+        svbool_t pg = svwhilelt_b32_u32(i, n);
+        svuint32_t ix = svmin_u32_x(pg, load_widen<T>(pg, sx + i), vmx);
+        svuint32_t iy = svmin_u32_x(pg, load_widen<U>(pg, sy + i), vmy);
+        svuint32_t idx = svadd_u32_x(pg, svlsl_u32_x(pg, iy, vsh), ix);
+        gather_store<V>(pg, d + i, lut, idx);
+    }
+}
+
+} // namespace
+
+void vs_lut2_gather_ww_w_sve(const uint16_t *sx, const uint16_t *sy, uint16_t *d, int w, const uint16_t *lut, int bitsx, unsigned mx, unsigned my) { lut2_gather<uint16_t, uint16_t, uint16_t>(sx, sy, d, w, lut, bitsx, mx, my); }
+void vs_lut2_gather_ww_b_sve(const uint16_t *sx, const uint16_t *sy, uint8_t *d, int w, const uint8_t *lut, int bitsx, unsigned mx, unsigned my) { lut2_gather<uint16_t, uint16_t, uint8_t>(sx, sy, d, w, lut, bitsx, mx, my); }
+void vs_lut2_gather_wb_w_sve(const uint16_t *sx, const uint8_t *sy, uint16_t *d, int w, const uint16_t *lut, int bitsx, unsigned mx, unsigned my) { lut2_gather<uint16_t, uint8_t, uint16_t>(sx, sy, d, w, lut, bitsx, mx, my); }
+void vs_lut2_gather_wb_b_sve(const uint16_t *sx, const uint8_t *sy, uint8_t *d, int w, const uint8_t *lut, int bitsx, unsigned mx, unsigned my) { lut2_gather<uint16_t, uint8_t, uint8_t>(sx, sy, d, w, lut, bitsx, mx, my); }
+void vs_lut2_gather_bw_w_sve(const uint8_t *sx, const uint16_t *sy, uint16_t *d, int w, const uint16_t *lut, int bitsx, unsigned mx, unsigned my) { lut2_gather<uint8_t, uint16_t, uint16_t>(sx, sy, d, w, lut, bitsx, mx, my); }
+void vs_lut2_gather_bw_b_sve(const uint8_t *sx, const uint16_t *sy, uint8_t *d, int w, const uint8_t *lut, int bitsx, unsigned mx, unsigned my) { lut2_gather<uint8_t, uint16_t, uint8_t>(sx, sy, d, w, lut, bitsx, mx, my); }
