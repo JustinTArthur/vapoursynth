@@ -866,9 +866,7 @@ void sme_v_plane(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
     { sme_sq_plane<SmeType::TY>(src, src_stride, dst, dst_stride, *params, width, height, N); }
 
 VS_SME_SQUARE_ENTRY(3x3,   3,  Byte,  byte)
-VS_SME_SQUARE_ENTRY(3x3,   3,  Word,  word)
 VS_SME_SQUARE_ENTRY(3x3,   3,  Float, float)
-VS_SME_SQUARE_ENTRY(3x3,   3,  Half,  half)
 VS_SME_SQUARE_ENTRY(5x5,   5,  Byte,  byte)
 VS_SME_SQUARE_ENTRY(7x7,   7,  Byte,  byte)
 VS_SME_SQUARE_ENTRY(9x9,   9,  Byte,  byte)

@@ -438,9 +438,7 @@ DECL(1d_conv_v, float, sme)
 /* 3x3: excluded from dispatch by default (too few taps for the band to pay);
    built so the choice can be re-measured. */
 DECL_3x3(conv, byte, sme)
-DECL_3x3(conv, word, sme)
 DECL_3x3(conv, float, sme)
-DECL_3x3(conv, half, sme)
 
 /* half: samples widen to f32 and reuse the ZA32 FMOPA path. */
 DECL(5x5_conv, half, sme)
