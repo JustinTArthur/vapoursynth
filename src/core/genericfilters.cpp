@@ -757,22 +757,22 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         return nullptr;
 
     const CPUFeatures *cpu = getCPUFeatures();
-    // NB the <= 4 cutoff is not sharply validated. What is solid: SME wins these
-    // shapes decisively at 1-2 threads (3x3 byte +48%/+36%) and loses decisively on
-    // a full pool (3x3 byte 0.35x at 16), because the SME unit is shared per cluster.
-    // At exactly 4 threads the two tiers are indistinguishable on the M4 -- the
-    // run-to-run spread there is +-5-9%, wider than any difference between them --
-    // so the boundary sits somewhere in 4..8 and 4 is a reasonable, not a measured,
-    // place to put it. Re-measure with many more frames before moving it.
+    // Thread-count sweep on the M4 (SME/NEON ratio, 1/2/4/8/16 threads; the SME unit
+    // is shared per cluster so it saturates as the pool fills). The heavier shapes
+    // still win clearly at 4 threads and only collapse at 8-16, which is what the
+    // <= 4 cutoff excludes -- e.g. at 4t: v25 word 2.90x, s7x7 word 1.77x, s3x3 float
+    // 1.23x, s9x9 byte 1.13x. The cheapest shape saturates soonest: 3x3 byte wins at
+    // 1-2t (1.36x/1.38x) but reproducibly loses at 4t (~0.90x), so it uses a tighter
+    // <= 2 gate. (Raw curves: bench/logs/sme_thread_sweep_m4.log.)
     const bool few_threads = d->corethreads <= 4;
+    const bool tiny_pool = d->corethreads <= 2;   // for shapes that saturate by 4 threads
 
     if (fi->sampleType == stInteger && fi->bytesPerSample == 1) {
-        // 3x3 was assumed too small for the band to pay. It does pay, but only on a
-        // small pool: single-threaded it is +34% (byte) / +64% (float) / +10% (half),
-        // while at 16 threads the shared SME unit becomes the bottleneck for so cheap
-        // a shape and it collapses (byte 5959 vs 17237 fps). word loses even at one
-        // thread (-9%) and never takes it.
-        if (few_threads && d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
+        // 3x3 was assumed too small for the band to pay. It does pay single-threaded
+        // (+34%), but 3x3 byte is the cheapest shape and saturates the shared unit by
+        // 4 threads (1.36x/1.38x at 1-2t, ~0.90x at 4t), so it takes the tighter gate.
+        // word 3x3 loses even at one thread and never takes SME.
+        if (tiny_pool && d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
             return vs_generic_3x3_conv_byte_sme;
         // With the usdot kernels in play the byte square picture inverts (M4):
         // NEON wins 5x5 and 7x7 outright even single-threaded, and wins every
@@ -828,9 +828,9 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         if (!d->conv_f16)
             return nullptr;
 
-        if (few_threads && d->convolution_type == ConvolutionSquare && d->matrix_elements == 9)
-            return vs_generic_3x3_conv_half_sme;
-        else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
+        // 3x3 half is break-even against NEON at every thread count (1.00-1.11x,
+        // within noise), so it stays on NEON -- not worth an SME dispatch.
+        if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
             return vs_generic_7x7_conv_half_sme;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
             return vs_generic_9x9_conv_half_sme;
