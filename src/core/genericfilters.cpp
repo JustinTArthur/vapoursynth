@@ -784,9 +784,9 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
             if (!few_threads)
                 return nullptr;
             if (d->matrix_elements == 81)
-                return vs_generic_9x9_conv_byte_sme;
+                return vs_generic_9x9_conv_byte_sme;              // wins through 4t (1.13x)
             else if (d->matrix_elements == 121)
-                return vs_generic_11x11_conv_byte_sme;
+                return tiny_pool ? vs_generic_11x11_conv_byte_sme : nullptr;  // only break-even at 4t, so pool <= 2
             return nullptr;
         }
 
@@ -808,9 +808,11 @@ static decltype(&vs_generic_3x3_conv_byte_c) genericSelectSME(const VSVideoForma
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 49)
             return vs_generic_7x7_conv_word_sme;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 81)
-            return cpu->sme_i16i64 ? vs_generic_9x9_conv_word_sme : nullptr;
+            // 9x9 word only breaks even at 4t (0.97x); the cheaper shape saturates the
+            // shared unit sooner than 11x11, so it takes the tighter pool <= 2 gate.
+            return (tiny_pool && cpu->sme_i16i64) ? vs_generic_9x9_conv_word_sme : nullptr;
         else if (d->convolution_type == ConvolutionSquare && d->matrix_elements == 121)
-            return cpu->sme_i16i64 ? vs_generic_11x11_conv_word_sme : nullptr;
+            return cpu->sme_i16i64 ? vs_generic_11x11_conv_word_sme : nullptr;  // wins through 4t (1.19x)
         else if (d->convolution_type == ConvolutionVertical)
             return vs_generic_1d_conv_v_word_sme;
     } else if (fi->sampleType == stFloat && fi->bytesPerSample == 2) {
