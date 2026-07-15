@@ -437,21 +437,6 @@ void sv_plane_h(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
 }
 
 template <SvType TY>
-void sv_plane_v(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
-                const vs_generic_params &p, unsigned width, unsigned height)
-{
-    typedef typename sv_traits<TY>::T T;
-    const uint32_t satmask = p.saturate ? 0xFFFFFFFFu : 0x7FFFFFFFu;
-    int32_t wb = sv_word_bias_sum<TY>(sv_coeffs<TY>(p), p.matrixsize);
-    for (unsigned i = 0; i < height; ++i) {
-        const void *srcp[25];
-        sv_select_rows(src, ss, srcp, i, height, p.matrixsize);
-        T *dstp = reinterpret_cast<T *>(static_cast<uint8_t *>(dst) + static_cast<ptrdiff_t>(i) * ds);
-        sv_v_scanline<TY>(srcp, dstp, width, p, satmask, wb);
-    }
-}
-
-template <SvType TY>
 void sv_plane_x(const void *src, ptrdiff_t ss, void *dst, ptrdiff_t ds,
                 const vs_generic_params &p, unsigned width, unsigned height)
 {
@@ -557,8 +542,6 @@ VS_SVE_SQUARE_ENTRY(11x11, 11, Byte,  byte)
     void vs_generic_##SZ##_conv_word_sve_dot(const void *src, ptrdiff_t src_stride, void *dst, ptrdiff_t dst_stride, const struct vs_generic_params *params, unsigned width, unsigned height) \
     { sv_sq_word_dot_plane(src, src_stride, dst, dst_stride, *params, width, height, N); }
 
-VS_SVE_SQUARE_DOT_ENTRY(3x3,   3)
-VS_SVE_SQUARE_DOT_ENTRY(5x5,   5)
 VS_SVE_SQUARE_DOT_ENTRY(7x7,   7)
 VS_SVE_SQUARE_DOT_ENTRY(9x9,   9)
 VS_SVE_SQUARE_DOT_ENTRY(11x11, 11)
@@ -567,8 +550,6 @@ VS_SVE_SQUARE_ENTRY(5x5,   5,  Word,  word)
 VS_SVE_SQUARE_ENTRY(7x7,   7,  Word,  word)
 VS_SVE_SQUARE_ENTRY(9x9,   9,  Word,  word)
 VS_SVE_SQUARE_ENTRY(11x11, 11, Word,  word)
-VS_SVE_SQUARE_ENTRY(5x5,   5,  Float, float)
-VS_SVE_SQUARE_ENTRY(7x7,   7,  Float, float)
 VS_SVE_SQUARE_ENTRY(9x9,   9,  Float, float)
 VS_SVE_SQUARE_ENTRY(11x11, 11, Float, float)
 
@@ -578,16 +559,8 @@ VS_SVE_SQUARE_ENTRY(11x11, 11, Float, float)
 
 VS_SVE_ENTRY(3x3_conv, sv_plane_3x3, Byte, byte)
 VS_SVE_ENTRY(3x3_conv, sv_plane_3x3, Word, word)
-VS_SVE_ENTRY(3x3_conv, sv_plane_3x3, Float, float)
 
 VS_SVE_ENTRY(1d_conv_h, sv_plane_h, Byte, byte)
-VS_SVE_ENTRY(1d_conv_h, sv_plane_h, Word, word)
-VS_SVE_ENTRY(1d_conv_h, sv_plane_h, Float, float)
 
-VS_SVE_ENTRY(1d_conv_v, sv_plane_v, Byte, byte)
-VS_SVE_ENTRY(1d_conv_v, sv_plane_v, Word, word)
-VS_SVE_ENTRY(1d_conv_v, sv_plane_v, Float, float)
 
 VS_SVE_ENTRY(2d_conv_sep, sv_plane_x, Byte, byte)
-VS_SVE_ENTRY(2d_conv_sep, sv_plane_x, Word, word)
-VS_SVE_ENTRY(2d_conv_sep, sv_plane_x, Float, float)

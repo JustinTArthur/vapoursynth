@@ -371,7 +371,6 @@ unsigned vs_sve_vector_length(void);
 
 DECL_3x3(conv, byte, sve)
 DECL_3x3(conv, word, sve)
-DECL_3x3(conv, float, sve)
 
 DECL(5x5_conv, byte, sve)
 DECL(7x7_conv, byte, sve)
@@ -381,26 +380,15 @@ DECL(5x5_conv, word, sve)
 DECL(7x7_conv, word, sve)
 DECL(9x9_conv, word, sve)
 DECL(11x11_conv, word, sve)
-DECL(5x5_conv, float, sve)
-DECL(7x7_conv, float, sve)
 DECL(9x9_conv, float, sve)
 DECL(11x11_conv, float, sve)
 
 DECL(1d_conv_h, byte, sve)
-DECL(1d_conv_h, word, sve)
-DECL(1d_conv_h, float, sve)
 
-DECL(1d_conv_v, byte, sve)
-DECL(1d_conv_v, word, sve)
-DECL(1d_conv_v, float, sve)
 
 DECL(2d_conv_sep, byte, sve)
-DECL(2d_conv_sep, word, sve)
-DECL(2d_conv_sep, float, sve)
 /* svdot_s64 word squares: base SVE, and the only integer SVE form that beats
    NEON at a 128-bit VL, so these are dispatched at any vector length. */
-DECL(3x3_conv, word, sve_dot)
-DECL(5x5_conv, word, sve_dot)
 DECL(7x7_conv, word, sve_dot)
 DECL(9x9_conv, word, sve_dot)
 DECL(11x11_conv, word, sve_dot)
