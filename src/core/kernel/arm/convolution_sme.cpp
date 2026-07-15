@@ -144,6 +144,34 @@ inline svint64_t read_za64_s64(unsigned t, uint32_t slice) __arm_streaming __arm
     }
 }
 
+// SME2 multi-vector ZA reads: one instruction pulls four consecutive
+// horizontal slices (output rows) of a tile, cutting the store-side ZA
+// readout instruction count 4x versus the slice-at-a-time reads above. This
+// pays off in the vertical 1D kernels, where the readout is a large share of
+// the per-block work; the square kernels see no benefit (the outer products
+// dominate) and are left on the single-slice path.
+__attribute__((always_inline))
+inline svint32x4_t read_za32_s32_x4(unsigned t, uint32_t base) __arm_streaming __arm_in("za")
+{
+    switch (t) {
+    case 0: return svread_hor_za32_s32_vg4(0, base);
+    case 1: return svread_hor_za32_s32_vg4(1, base);
+    case 2: return svread_hor_za32_s32_vg4(2, base);
+    default: return svread_hor_za32_s32_vg4(3, base);
+    }
+}
+
+__attribute__((always_inline))
+inline svfloat32x4_t read_za32_f32_x4(unsigned t, uint32_t base) __arm_streaming __arm_in("za")
+{
+    switch (t) {
+    case 0: return svread_hor_za32_f32_vg4(0, base);
+    case 1: return svread_hor_za32_f32_vg4(1, base);
+    case 2: return svread_hor_za32_f32_vg4(2, base);
+    default: return svread_hor_za32_f32_vg4(3, base);
+    }
+}
+
 // Pixel row loads, widened to the int16 MOPA input domain.
 __attribute__((always_inline))
 inline svint16_t load_px_i16(const uint8_t *p, svbool_t pg, bool word) __arm_streaming
@@ -295,6 +323,25 @@ void sme_sq_int64_interior(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t d
 inline void st_f32_half(svbool_t pg, uint16_t *p, svfloat32_t f) __arm_streaming
 {
     svst1h_u32(pg, p, svreinterpret_u32_f16(svcvt_f16_f32_x(pg, f)));
+}
+
+// scale/bias/saturate + store of one f32 tile row (float and half outputs).
+__attribute__((always_inline))
+inline void store_row_float(float *dst, svbool_t pgw, svfloat32_t f, float div, float fbias, uint32_t satmask) __arm_streaming
+{
+    svbool_t pt = svptrue_b32();
+    f = svmad_n_f32_x(pt, f, svdup_f32(div), fbias);
+    f = svreinterpret_f32_u32(svand_n_u32_x(pt, svreinterpret_u32_f32(f), satmask));
+    svst1_f32(pgw, dst, f);
+}
+
+__attribute__((always_inline))
+inline void store_row_half(uint16_t *dst, svbool_t pgw, svfloat32_t f, float div, float fbias, uint32_t satmask) __arm_streaming
+{
+    svbool_t pt = svptrue_b32();
+    f = svmad_n_f32_x(pt, f, svdup_f32(div), fbias);
+    f = svreinterpret_f32_u32(svand_n_u32_x(pt, svreinterpret_u32_f32(f), satmask));
+    st_f32_half(pgw, dst, f);
 }
 
 // ---- square NxN, half, native 2-way f16 FMOPA ---------------------------------
@@ -473,13 +520,20 @@ void sme_v_int32_plane(const uint8_t *const *rows, ptrdiff_t elem_size, uint8_t 
                     mopa32_i16(t, pt16, pt16, zn, svzip1_s16(va, vb));
                 }
             }
-            for (unsigned i = 0; i < vr; ++i) {
-                uint8_t *drow = dst + static_cast<ptrdiff_t>(y + i) * ds;
-                for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                    svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
-                    store_row_int(drow + (static_cast<size_t>(cb) + t * TR) * elem_size, pgw,
-                                  read_za32_s32(t, i), wb, div, fbias, satmask, maxclamp, word);
+            for (unsigned t = 0; t < 4 && v[t]; ++t) {
+                svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
+                size_t coff = (static_cast<size_t>(cb) + t * TR) * elem_size;
+                unsigned i = 0;
+                for (; i + 4 <= vr; i += 4) {
+                    svint32x4_t z = read_za32_s32_x4(t, i);
+                    store_row_int(dst + static_cast<ptrdiff_t>(y + i + 0) * ds + coff, pgw, svget4_s32(z, 0), wb, div, fbias, satmask, maxclamp, word);
+                    store_row_int(dst + static_cast<ptrdiff_t>(y + i + 1) * ds + coff, pgw, svget4_s32(z, 1), wb, div, fbias, satmask, maxclamp, word);
+                    store_row_int(dst + static_cast<ptrdiff_t>(y + i + 2) * ds + coff, pgw, svget4_s32(z, 2), wb, div, fbias, satmask, maxclamp, word);
+                    store_row_int(dst + static_cast<ptrdiff_t>(y + i + 3) * ds + coff, pgw, svget4_s32(z, 3), wb, div, fbias, satmask, maxclamp, word);
                 }
+                for (; i < vr; ++i)
+                    store_row_int(dst + static_cast<ptrdiff_t>(y + i) * ds + coff, pgw,
+                                  read_za32_s32(t, i), wb, div, fbias, satmask, maxclamp, word);
             }
         }
     }
@@ -513,15 +567,19 @@ void sme_v_float_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t ds,
                     mopa32_f32(t, pt32, pgw, zn, svld1_f32(pgw, row + cb + t * TR));
                 }
             }
-            for (unsigned i = 0; i < vr; ++i) {
-                float *drow = reinterpret_cast<float *>(dst + static_cast<ptrdiff_t>(y + i) * ds);
-                for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                    svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
-                    svfloat32_t f = read_za32_f32(t, i);
-                    f = svmad_n_f32_x(pt32, f, svdup_f32(div), fbias);
-                    f = svreinterpret_f32_u32(svand_n_u32_x(pt32, svreinterpret_u32_f32(f), satmask));
-                    svst1_f32(pgw, drow + cb + t * TR, f);
+            for (unsigned t = 0; t < 4 && v[t]; ++t) {
+                svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
+                const unsigned col = cb + t * TR;
+                unsigned i = 0;
+                for (; i + 4 <= vr; i += 4) {
+                    svfloat32x4_t z = read_za32_f32_x4(t, i);
+                    store_row_float(reinterpret_cast<float *>(dst + static_cast<ptrdiff_t>(y + i + 0) * ds) + col, pgw, svget4_f32(z, 0), div, fbias, satmask);
+                    store_row_float(reinterpret_cast<float *>(dst + static_cast<ptrdiff_t>(y + i + 1) * ds) + col, pgw, svget4_f32(z, 1), div, fbias, satmask);
+                    store_row_float(reinterpret_cast<float *>(dst + static_cast<ptrdiff_t>(y + i + 2) * ds) + col, pgw, svget4_f32(z, 2), div, fbias, satmask);
+                    store_row_float(reinterpret_cast<float *>(dst + static_cast<ptrdiff_t>(y + i + 3) * ds) + col, pgw, svget4_f32(z, 3), div, fbias, satmask);
                 }
+                for (; i < vr; ++i)
+                    store_row_float(reinterpret_cast<float *>(dst + static_cast<ptrdiff_t>(y + i) * ds) + col, pgw, read_za32_f32(t, i), div, fbias, satmask);
             }
         }
     }
@@ -552,7 +610,6 @@ void sme_v_half_fmopa_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t 
                             float div, float fbias, uint32_t satmask)
 {
     const unsigned TR = static_cast<unsigned>(svcntw());
-    const svbool_t pt32 = svptrue_b32();
     const svbool_t pt16 = svptrue_b16();
 
     for (unsigned y = 0; y < H; y += TR) {
@@ -580,15 +637,19 @@ void sme_v_half_fmopa_plane(const uint8_t *const *rows, uint8_t *dst, ptrdiff_t 
                     mopa32_f16(t, pt16, pcol, zn, svzip1_f16(a, b));
                 }
             }
-            for (unsigned i = 0; i < vr; ++i) {
-                uint16_t *drow = reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i) * ds);
-                for (unsigned t = 0; t < 4 && v[t]; ++t) {
-                    const svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
-                    svfloat32_t f = read_za32_f32(t, i);
-                    f = svmad_n_f32_x(pt32, f, svdup_f32(div), fbias);
-                    f = svreinterpret_f32_u32(svand_n_u32_x(pt32, svreinterpret_u32_f32(f), satmask));
-                    st_f32_half(pgw, drow + cb + t * TR, f);
+            for (unsigned t = 0; t < 4 && v[t]; ++t) {
+                const svbool_t pgw = svwhilelt_b32_u32(0, v[t]);
+                const unsigned col = cb + t * TR;
+                unsigned i = 0;
+                for (; i + 4 <= vr; i += 4) {
+                    svfloat32x4_t z = read_za32_f32_x4(t, i);
+                    store_row_half(reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i + 0) * ds) + col, pgw, svget4_f32(z, 0), div, fbias, satmask);
+                    store_row_half(reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i + 1) * ds) + col, pgw, svget4_f32(z, 1), div, fbias, satmask);
+                    store_row_half(reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i + 2) * ds) + col, pgw, svget4_f32(z, 2), div, fbias, satmask);
+                    store_row_half(reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i + 3) * ds) + col, pgw, svget4_f32(z, 3), div, fbias, satmask);
                 }
+                for (; i < vr; ++i)
+                    store_row_half(reinterpret_cast<uint16_t *>(dst + static_cast<ptrdiff_t>(y + i) * ds) + col, pgw, read_za32_f32(t, i), div, fbias, satmask);
             }
         }
     }
