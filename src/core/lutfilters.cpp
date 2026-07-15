@@ -641,11 +641,30 @@ static void lut2CreateHelper(const VSMap *in, VSMap *out, VSFunction *func, std:
 
        At 256 bits it is 8 lookups per gather and pays at every size Lut2 can reach
        (Graviton3, Neoverse-V1, 1 MB L2, single thread: 1.56x-2.17x from 256 KB to
-       2 MB), so there is nothing to gate on but the vector length. */
+       2 MB), so at one thread there is nothing to gate on but the vector length.
+
+       Thread contention adds one more gate. VapourSynth is frame-parallel (one whole
+       frame per thread), so a saturated pool runs num_threads copies of this kernel
+       at once, all competing for memory bandwidth. The heaviest combo -- word source
+       x word source into a word destination, the 2 MB table -- goes bandwidth-bound
+       there and the gather's latency-hiding stops paying: on Graviton3 all-core it is
+       a coin flip (0.87x-1.63x across runs, mean ~1.07x) where single-threaded it is a
+       clean 1.58x. Every lighter combo still wins all-core (byte dst 1.7-1.9x, word
+       dst under 2 MB 1.3-1.9x). So on a large pool the 2 MB word->word case falls back
+       to scalar; corethreads is a snapshot of the pool size at creation, the same
+       proxy the SME/usdot square gates use, with the same limitations. */
+    VSCoreInfo ci;
+    vsapi->getCoreInfo(core, &ci);
+    const bool big_pool = ci.numThreads > 4;
+    const size_t table_bytes = (size_t)inrange * sizeof(V);
     if constexpr (std::is_integral_v<V>) {
         if (getCPUFeatures()->sve && d->cpulevel >= VS_CPU_LEVEL_SVE) {
-            if (vs_sve_vector_length() > 16 || (size_t)inrange * sizeof(V) >= (1u << 20))
+            if (vs_sve_vector_length() > 16 || table_bytes >= (1u << 20))
                 d->use_gather = true;
+            // Heaviest combo (word dst, >= 2 MB table) is bandwidth-bound on a full
+            // pool; keep its single-thread win but yield to scalar under contention.
+            if (big_pool && sizeof(V) == 2 && table_bytes >= (2u << 20))
+                d->use_gather = false;
         }
     }
 #endif
