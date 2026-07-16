@@ -175,7 +175,7 @@ endif
 # kernels are compiled in a dedicated TU where every function is
 # __arm_locally_streaming: with +sme enabled the auto-vectoriser may otherwise
 # emit streaming-only SVE in regular functions, which faults outside streaming
-# mode -- keeping the whole TU streaming sidesteps that entirely.
+# mode; keeping the whole unit streaming prevents that.
 arm_have_sve = false
 arm_have_sme = false
 arm_have_i8mm = false

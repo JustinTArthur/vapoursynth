@@ -366,7 +366,7 @@ DECL(11x11_conv, byte, neon_dot)
 #endif /* VS_TARGET_ARM_I8MM */
 
 #ifdef VS_TARGET_ARM_SVE
-/* Non-streaming SVE (VLA) kernels; never built or dispatched on Apple silicon. */
+/* Non-streaming SVE (VLA) kernels; never built or dispatched on Apple Silicon. */
 unsigned vs_sve_vector_length(void);
 
 DECL_3x3(conv, byte, sve)

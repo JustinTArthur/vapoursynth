@@ -626,14 +626,14 @@ static void lut2CreateHelper(const VSMap *in, VSMap *out, VSFunction *func, std:
        what it has to beat is a scalar path whose table lookups are cheap while the
        table stays in cache. Those two effects split the gate.
 
-       At 128 bits a gather is only 4 lookups and does not pay on its own -- it needs
+       At 128 bits a gather is only 4 lookups and does not pay on its own; it needs
        the table to spill L2, where its several outstanding misses beat the scalar
        loop's one. Measured on Graviton4 (Neoverse-V2, 2 MB L2), single thread, table
        size swept with the kernel held fixed:
 
-         table    512 KB   1 MB   2 MB
-         word dst   0.87   1.63   1.58
-         byte dst   0.90   1.52     --     (256 KB: 0.92)
+         table    512 KB    1 MB    2 MB
+         word dst  0.87x   1.63x   1.58x
+         byte dst  0.90x   1.52x      --     (256 KB: 0.92x)
 
        The break-even is the table's size in bytes, not its entry count: 2^19 entries
        wins as a word table (1 MB) and loses as a byte one (512 KB). So on 128-bit

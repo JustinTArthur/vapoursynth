@@ -67,7 +67,7 @@ typedef struct CPUFeatures {
     char dotprod;     /* FEAT_DotProd: sdot/udot */
     char fp16;        /* FEAT_FP16: fullfp16 arithmetic */
     char i8mm;        /* FEAT_I8MM: usdot/ummla */
-    char sve;         /* FEAT_SVE, non-streaming (never set on Apple silicon) */
+    char sve;         /* FEAT_SVE, non-streaming (not set on Apple silicon) */
     char sve2;        /* FEAT_SVE2 */
     char sme;         /* FEAT_SME */
     char sme2;        /* FEAT_SME2 */

@@ -172,7 +172,7 @@ static void doGetCPUFeatures(CPUFeatures *cpuFeatures) {
 #include <sys/auxv.h>
 
 /* Bits from linux arch/arm64/include/uapi/asm/hwcap.h; defined here so old
-   toolchain headers do not limit runtime detection. */
+   toolchain headers don't limit runtime detection. */
 #ifndef HWCAP_FPHP
 #define HWCAP_FPHP (1UL << 9)
 #endif
